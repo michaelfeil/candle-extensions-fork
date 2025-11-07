@@ -113,7 +113,7 @@ checksum = "a9f51e2ecf6efe9737af8f993433c839f956d2b6ed4fd2dd4a7c6d8b0fa667ff"
 dependencies = [
  "byteorder",
  "candle-kernels",
- "cudarc 0.16.6",
+ "cudarc",
  "gemm 0.17.1",
  "half",
  "memmap2",
@@ -135,7 +135,7 @@ name = "candle-cublaslt"
 version = "0.0.1"
 dependencies = [
  "candle-core",
- "cudarc 0.17.7",
+ "cudarc",
  "half",
 ]
 
@@ -254,17 +254,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cudarc"
-version = "0.17.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff0da1a70ec91e66731c1752deb9fda3044f1154fe4ceb5873e3f96ed34cafa3"
-dependencies = [
- "float8",
- "half",
- "libloading",
-]
-
-[[package]]
 name = "derive_arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -335,15 +324,6 @@ name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
-
-[[package]]
-name = "float8"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f498aec3b227cd892ce18967f4033d9d397d28a80a7ab67e9f6b0176a79654e"
-dependencies = [
- "half",
-]
 
 [[package]]
 name = "gemm"
@@ -1237,7 +1217,7 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "14053653d0b7fa7b21015aa9a62edc8af2f60aa6f9c54e66386ecce55f22ed29"
 dependencies = [
- "cudarc 0.16.6",
+ "cudarc",
  "half",
  "serde",
  "thiserror",

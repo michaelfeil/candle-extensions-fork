@@ -19,7 +19,8 @@ impl CublasLt {
             _ => candle::bail!("`device` must be a `cuda` device"),
         };
 
-        let inner = CudaBlasLT::new(dev.cuda_device()).unwrap();
+        let inner = CudaBlasLT::new(dev.cuda_stream())
+            .map_err(|e| candle::Error::Cuda(Box::new(e)))?;
 
         Ok(Self(Arc::new(inner)))
     }
@@ -97,12 +98,13 @@ impl CublasLTMatmul {
             c.clone()
         } else {
             // Allocate out tensor
-            unsafe { dev.alloc::<f16>(out_shape.elem_count()).w()? }
+            unsafe { dev.alloc::<f16>(out_shape.elem_count())? }
         };
 
         let config = MatmulConfig {
             transa: true,
             transb: false,
+            transc: false,
             m: m as u64,
             n: n as u64,
             k: k as u64,
@@ -192,12 +194,13 @@ impl CublasLTMatmul {
             c.clone()
         } else {
             // Allocate out tensor
-            unsafe { dev.alloc::<bf16>(out_shape.elem_count()).w()? }
+            unsafe { dev.alloc::<bf16>(out_shape.elem_count())? }
         };
 
         let config = MatmulConfig {
             transa: true,
             transb: false,
+            transc: false,
             m: m as u64,
             n: n as u64,
             k: k as u64,
@@ -287,12 +290,13 @@ impl CublasLTMatmul {
             c.clone()
         } else {
             // Allocate out tensor
-            unsafe { dev.alloc::<f32>(out_shape.elem_count()).w()? }
+            unsafe { dev.alloc::<f32>(out_shape.elem_count())? }
         };
 
         let config = MatmulConfig {
             transa: true,
             transb: false,
+            transc: false,
             m: m as u64,
             n: n as u64,
             k: k as u64,
@@ -505,7 +509,7 @@ impl CublasLTBatchMatmul {
         } else {
             // Allocate out tensor
             (
-                unsafe { dev.alloc::<f16>(out_shape.elem_count()).w()? },
+                unsafe { dev.alloc::<f16>(out_shape.elem_count())? },
                 (n * m),
             )
         };
@@ -513,6 +517,7 @@ impl CublasLTBatchMatmul {
         let config = MatmulConfig {
             transa: true,
             transb: false,
+            transc: false,
             m: m as u64,
             n: n as u64,
             k: k as u64,
@@ -608,7 +613,7 @@ impl CublasLTBatchMatmul {
         } else {
             // Allocate out tensor
             (
-                unsafe { dev.alloc::<bf16>(out_shape.elem_count()).w()? },
+                unsafe { dev.alloc::<bf16>(out_shape.elem_count())? },
                 (n * m),
             )
         };
@@ -616,6 +621,7 @@ impl CublasLTBatchMatmul {
         let config = MatmulConfig {
             transa: true,
             transb: false,
+            transc: false,
             m: m as u64,
             n: n as u64,
             k: k as u64,
@@ -711,7 +717,7 @@ impl CublasLTBatchMatmul {
         } else {
             // Allocate out tensor
             (
-                unsafe { dev.alloc::<f32>(out_shape.elem_count()).w()? },
+                unsafe { dev.alloc::<f32>(out_shape.elem_count())? },
                 (n * m),
             )
         };
@@ -719,6 +725,7 @@ impl CublasLTBatchMatmul {
         let config = MatmulConfig {
             transa: true,
             transb: false,
+            transc: false,
             m: m as u64,
             n: n as u64,
             k: k as u64,
