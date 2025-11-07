@@ -33,7 +33,7 @@ fn apply_rotary_<
     };
 
     // Get the CUDA stream from the device
-    let stream = q.device().cuda_stream();
+    let stream = q.device.cuda_stream();
 
     let (k, k_l) = key.storage_and_layout();
     let k = match &*k {
