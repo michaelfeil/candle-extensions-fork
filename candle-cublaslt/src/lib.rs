@@ -2,7 +2,6 @@ pub use cudarc::cublaslt::Activation;
 use std::ffi::c_int;
 
 use candle::backend::BackendStorage;
-use candle::cuda_backend::WrapErr;
 use candle::{CpuStorage, Device, Layout, Result, Shape, Storage, Tensor};
 use half::{bf16, f16};
 use std::sync::Arc;
