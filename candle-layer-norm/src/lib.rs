@@ -153,56 +153,60 @@ impl LayerNorm {
         let out_shape = Shape::from((rows * 2, cols));
 
         let out = unsafe { dev.alloc::<T>(out_shape.elem_count())? };
-        let dst = out.slice(..rows * cols);
-        let dst_add = out.slice(rows * cols..);
 
         // Alloc internal buffers
         let mu = unsafe { dev.alloc::<f32>(rows)? };
         let rsigma = unsafe { dev.alloc::<f32>(rows)? };
-
-        // Get cuda device pointers from cuda slices
-        let (x_ptr, _x_guard) = x.device_ptr(&stream);
-        let x_ptr = x_ptr as *const core::ffi::c_void;
-        let (g_ptr, _g_guard) = g.device_ptr(&stream);
-        let g_ptr = g_ptr as *const core::ffi::c_void;
-        let (dst_add_ptr, _dst_add_guard) = dst_add.device_ptr(&stream);
-        let dst_add_ptr = dst_add_ptr as *const core::ffi::c_void;
-        let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
-        let dst_ptr = dst_ptr as *const core::ffi::c_void;
-        let (mu_ptr, _mu_guard) = mu.device_ptr(&stream);
-        let mu_ptr = mu_ptr as *const core::ffi::c_void;
-        let (rsigma_ptr, _rsigma_guard) = rsigma.device_ptr(&stream);
-        let rsigma_ptr = rsigma_ptr as *const core::ffi::c_void;
 
         let multi_processors_count = stream
             .context()
             .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
             .unwrap();
 
-        unsafe {
-            // Launch Kernel
-            ffi::run_ln(
-                x_ptr,
-                r_ptr,
-                g_ptr,
-                b_ptr,
-                dst_add_ptr,
-                dst_ptr,
-                mu_ptr,
-                rsigma_ptr,
-                self.epsilon,
-                cols_rounded as u32,
-                rows as u32,
-                cols as u32,
-                multi_processors_count,
-                layer_norm_type,
-                layer_norm_type,
-                layer_norm_type,
-                layer_norm_type,
-                2,
-                is_rms_norm,
-            )
-        }
+        // Wrap kernel launch in a scope to ensure guards are dropped before moving `out`
+        {
+            let dst = out.slice(..rows * cols);
+            let dst_add = out.slice(rows * cols..);
+
+            // Get cuda device pointers from cuda slices
+            let (x_ptr, _x_guard) = x.device_ptr(&stream);
+            let x_ptr = x_ptr as *const core::ffi::c_void;
+            let (g_ptr, _g_guard) = g.device_ptr(&stream);
+            let g_ptr = g_ptr as *const core::ffi::c_void;
+            let (dst_add_ptr, _dst_add_guard) = dst_add.device_ptr(&stream);
+            let dst_add_ptr = dst_add_ptr as *const core::ffi::c_void;
+            let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
+            let dst_ptr = dst_ptr as *const core::ffi::c_void;
+            let (mu_ptr, _mu_guard) = mu.device_ptr(&stream);
+            let mu_ptr = mu_ptr as *const core::ffi::c_void;
+            let (rsigma_ptr, _rsigma_guard) = rsigma.device_ptr(&stream);
+            let rsigma_ptr = rsigma_ptr as *const core::ffi::c_void;
+
+            unsafe {
+                // Launch Kernel
+                ffi::run_ln(
+                    x_ptr,
+                    r_ptr,
+                    g_ptr,
+                    b_ptr,
+                    dst_add_ptr,
+                    dst_ptr,
+                    mu_ptr,
+                    rsigma_ptr,
+                    self.epsilon,
+                    cols_rounded as u32,
+                    rows as u32,
+                    cols as u32,
+                    multi_processors_count,
+                    layer_norm_type,
+                    layer_norm_type,
+                    layer_norm_type,
+                    layer_norm_type,
+                    2,
+                    is_rms_norm,
+                )
+            }
+        } // Guards are dropped here
 
         let out = candle::CudaStorage::wrap_cuda_slice(out, dev.clone());
 
