@@ -41,6 +41,9 @@ impl LayerNorm {
         // Assume all tensors are on the same device and take device of x
         let dev = x.device();
 
+        // Get the CUDA stream once and use it for all device_ptr calls
+        let stream = dev.cuda_stream();
+
         // Get internal layer norm type id for the given dtype
         let layer_norm_type = layer_norm_internal_type(x.dtype())?;
 
@@ -112,7 +115,7 @@ impl LayerNorm {
             if b_stride[b_rank - 1] != 1 {
                 candle::bail!("the last dim of b must be contiguous {b_stride:?}")
             }
-            let (b_ptr, _b_guard) = b.device_ptr(b.stream());
+            let (b_ptr, _b_guard) = b.device_ptr(&stream);
             b_ptr as *const core::ffi::c_void
         } else {
             ptr::null() as *const std::ffi::c_void
@@ -139,7 +142,7 @@ impl LayerNorm {
             if r_stride[r_rank - 1] != 1 {
                 candle::bail!("the last dim of r must be contiguous {r_stride:?}")
             }
-            let (r_ptr, _r_guard) = r.device_ptr(r.stream());
+            let (r_ptr, _r_guard) = r.device_ptr(&stream);
             r_ptr as *const std::ffi::c_void
         } else {
             ptr::null() as *const std::ffi::c_void
@@ -158,20 +161,19 @@ impl LayerNorm {
         let rsigma = unsafe { dev.alloc::<f32>(rows)? };
 
         // Get cuda device pointers from cuda slices
-        let (x_ptr, _x_guard) = x.device_ptr(x.stream());
+        let (x_ptr, _x_guard) = x.device_ptr(&stream);
         let x_ptr = x_ptr as *const core::ffi::c_void;
-        let (g_ptr, _g_guard) = g.device_ptr(g.stream());
+        let (g_ptr, _g_guard) = g.device_ptr(&stream);
         let g_ptr = g_ptr as *const core::ffi::c_void;
-        let (dst_add_ptr, _dst_add_guard) = dst_add.device_ptr(dst_add.stream());
+        let (dst_add_ptr, _dst_add_guard) = dst_add.device_ptr(&stream);
         let dst_add_ptr = dst_add_ptr as *const core::ffi::c_void;
-        let (dst_ptr, _dst_guard) = dst.device_ptr(dst.stream());
+        let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
         let dst_ptr = dst_ptr as *const core::ffi::c_void;
-        let (mu_ptr, _mu_guard) = mu.device_ptr(mu.stream());
+        let (mu_ptr, _mu_guard) = mu.device_ptr(&stream);
         let mu_ptr = mu_ptr as *const core::ffi::c_void;
-        let (rsigma_ptr, _rsigma_guard) = rsigma.device_ptr(rsigma.stream());
+        let (rsigma_ptr, _rsigma_guard) = rsigma.device_ptr(&stream);
         let rsigma_ptr = rsigma_ptr as *const core::ffi::c_void;
 
-        let stream = dev.cuda_stream();
         let multi_processors_count = stream
             .context()
             .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
