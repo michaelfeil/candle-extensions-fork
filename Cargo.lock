@@ -158,7 +158,7 @@ dependencies = [
 
 [[package]]
 name = "candle-cublaslt"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "candle-core 0.9.2-alpha.1",
  "cudarc 0.17.7",
@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "candle-flash-attn-v1"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "candle-core 0.9.2-alpha.1",
@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "candle-layer-norm"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "candle-core 0.9.2-alpha.1",
@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "candle-rotary"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "bindgen_cuda",
