@@ -1,6 +1,6 @@
 [package]
 name = "candle-cudnn-attn"
-description = "cuDNN attention bindings for candle"
+description = "cuDNN attention bindings for candle - flash-attention compatible API"
 homepage = "https://github.com/huggingface/candle-extensions/candle-cudnn-attn/"
 documentation = "https://docs.rs/candle-cudnn-attn"
 readme = "README.md"
@@ -13,13 +13,10 @@ repository.workspace = true
 
 [dependencies]
 candle = { workspace = true }
-cudarc = { workspace = true }
 thiserror = "1.0"
-libc = "0.2"
 
 [build-dependencies]
-bindgen = "0.69"
+bindgen = "0.72"
 
 [features]
 default = []
-cuda = []
