@@ -129,3 +129,11 @@ impl From<CuDNNError> for CandleError {
         CandleError::msg(err.to_string())
     }
 }
+
+impl From<CandleError> for CuDNNError {
+    fn from(err: CandleError) -> Self {
+        CuDNNError::Internal {
+            message: err.to_string(),
+        }
+    }
+}

@@ -1,11 +1,11 @@
-//! Basic cuDNN attention example
+//! Basic cuDNN attention example with flash-attention compatible API
 
 use candle::{Device, Tensor};
-use candle_cudnn_attn::cudnn_attention_varlen;
+use candle_cudnn_attn::flash_attn_varlen;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("cuDNN Attention Example");
-    println!("======================");
+    println!("cuDNN Attention Example - Flash-Attention Compatible API");
+    println!("========================================================");
 
     // Check availability
     if !candle_cudnn_attn::is_available() {
@@ -23,66 +23,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = Device::new_cuda(0)?;
     println!("📱 Using CUDA device: {:?}", device);
 
-    // Create test tensors
-    let batch_size = 4;
+    // Create test tensors in 3D format (flash-attention compatible)
     let num_heads = 8;
+    let batch_size = 4;
     let seq_len = 128;
     let head_dim = 64;
+    let total_tokens = batch_size * seq_len;
 
     println!("\n📊 Tensor Configuration:");
-    println!("  Batch size: {}", batch_size);
     println!("  Number of heads: {}", num_heads);
+    println!("  Batch size: {}", batch_size);
     println!("  Sequence length: {}", seq_len);
     println!("  Head dimension: {}", head_dim);
+    println!("  Total tokens: {}", total_tokens);
 
-    // Create random tensors
-    let q = Tensor::randn(
-        0.0,
-        1.0,
-        (batch_size, num_heads, seq_len, head_dim),
-        &device,
-    )?;
-    let k = Tensor::randn(
-        0.0,
-        1.0,
-        (batch_size, num_heads, seq_len, head_dim),
-        &device,
-    )?;
-    let v = Tensor::randn(
-        0.0,
-        1.0,
-        (batch_size, num_heads, seq_len, head_dim),
-        &device,
-    )?;
+    // Create random tensors in 3D format: (num_heads, total_tokens, head_dim)
+    let q = Tensor::randn(0.0, 1.0, (num_heads, total_tokens, head_dim), &device)?;
+    let k = Tensor::randn(0.0, 1.0, (num_heads, total_tokens, head_dim), &device)?;
+    let v = Tensor::randn(0.0, 1.0, (num_heads, total_tokens, head_dim), &device)?;
 
     println!("✅ Created input tensors");
 
-    // Create ragged offset for variable length sequences
-    // In this example, we'll use uniform lengths for simplicity
-    let mut offsets = vec![0];
+    // Create cumulative sequence lengths (cu_seqlens)
+    // For batch_size=4 with uniform seq_len=128: [0, 128, 256, 384, 512]
+    let mut seqlens = vec![0u32];
     for i in 1..=batch_size {
-        offsets.push((i * seq_len * num_heads * head_dim) as i32);
+        seqlens.push((i * seq_len) as u32);
     }
 
-    let ragged_offset = Tensor::from_vec(
-        offsets.iter().map(|&x| x as u32).collect::<Vec<_>>(),
-        (batch_size + 1, 1, 1, 1),
-        &device,
-    )?;
-    println!("✅ Created ragged offset tensor");
+    let seqlens_q = Tensor::new(&seqlens[..], &device)?;
+    let seqlens_k = Tensor::new(&seqlens[..], &device)?;
+    println!("✅ Created cumulative sequence lengths (cu_seqlens)");
 
     // Run attention
     println!("\n🚀 Running cuDNN attention...");
     let start = std::time::Instant::now();
 
-    let output = cudnn_attention_varlen(
+    let output = flash_attn_varlen(
         &q,
         &k,
         &v,
-        &ragged_offset,
-        seq_len,
+        &seqlens_q,
+        &seqlens_k,
+        seq_len, // max_seqlen_q
+        seq_len, // max_seqlen_k
         1.0 / (head_dim as f32).sqrt(),
-        true,
+        true, // causal
     )?;
 
     let duration = start.elapsed();
