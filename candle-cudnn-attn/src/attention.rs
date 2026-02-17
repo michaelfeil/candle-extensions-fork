@@ -7,10 +7,9 @@ use std::sync::OnceLock;
 static CUDNN_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 fn check_cudnn_availability() -> crate::error::Result<bool> {
-    match crate::graph::CuDNNGraph::new() {
-        Ok(_) => Ok(true),
-        Err(_) => Ok(false),
-    }
+    // Minimal runtime probe: if cuDNN is linked and callable, version is > 0.
+    let version = unsafe { crate::ffi::cudnnGetVersion() };
+    Ok(version > 0)
 }
 
 struct CuDNNAttnTHD {
@@ -123,26 +122,28 @@ impl CuDNNAttnTHD {
 
         let stream_ptr = *dev.cu_stream() as *mut core::ffi::c_void;
 
-        crate::frontend::run_thd_sdpa_fwd(
-            q_ptr,
-            k_ptr,
-            v_ptr,
-            o_ptr,
-            seq_q_ptr,
-            seq_kv_ptr,
-            q_ragged_ptr,
-            k_ragged_ptr,
-            v_ragged_ptr,
-            o_ragged_ptr,
-            num_seqs,
-            num_heads,
-            self.max_seqlen as i64,
-            head_dim,
-            self.softmax_scale,
-            self.causal,
+        let params = crate::frontend::ThdSdpaFwdParams {
+            q: q_ptr,
+            k: k_ptr,
+            v: v_ptr,
+            o: o_ptr,
+            seq_q: seq_q_ptr,
+            seq_kv: seq_kv_ptr,
+            q_ragged: q_ragged_ptr,
+            k_ragged: k_ragged_ptr,
+            v_ragged: v_ragged_ptr,
+            o_ragged: o_ragged_ptr,
+            b: num_seqs,
+            h: num_heads,
+            s: self.max_seqlen as i64,
+            d: head_dim,
+            attn_scale: self.softmax_scale,
+            causal: self.causal,
             is_bf16,
-            stream_ptr,
-        )
+            stream: stream_ptr,
+        };
+
+        crate::frontend::run_thd_sdpa_fwd(&params)
         .map_err(candle::Error::msg)?;
 
         let dst = candle::CudaStorage::wrap_cuda_slice(dst, dev.clone());

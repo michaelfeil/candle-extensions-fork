@@ -47,7 +47,7 @@ pub enum CuDNNError {
 
 impl CuDNNError {
     /// Create a cuDNN error from status code
-    pub fn cudnn_error(status: i32, message: impl Into<String>) -> Self {
+    pub fn from_cudnn_status(status: i32, message: impl Into<String>) -> Self {
         Self::FrontendError {
             code: status,
             message: message.into(),

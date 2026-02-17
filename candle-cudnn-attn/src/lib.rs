@@ -10,13 +10,9 @@ pub mod attention;
 pub mod error;
 pub mod ffi;
 pub mod frontend;
-pub mod graph;
-pub mod tensor;
 
 pub use attention::*;
 pub use error::*;
-pub use graph::*;
-pub use tensor::*;
 
 pub fn is_available() -> bool {
     attention::is_available()
