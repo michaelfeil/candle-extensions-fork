@@ -106,7 +106,11 @@ fn find_cudnn_include() -> Option<PathBuf> {
         return Some(apt_path);
     }
 
-    let paths = ["/usr/local/cuda/include", "/usr/include", "/usr/local/include"];
+    let paths = [
+        "/usr/local/cuda/include",
+        "/usr/include",
+        "/usr/local/include",
+    ];
     for path in &paths {
         let cudnn_h = PathBuf::from(path).join("cudnn.h");
         if cudnn_h.exists() {
