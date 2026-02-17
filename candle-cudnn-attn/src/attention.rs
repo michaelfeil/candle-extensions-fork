@@ -106,23 +106,14 @@ fn attention_varlen_impl(
     // Check if cuDNN is actually available and working
     let available = check_cudnn_availability()?;
 
-    if available {
-        // Try to use cuDNN implementation
-        match cudnn_attention_impl(q, k, v, ragged_offset, softmax_scale, causal) {
-            Ok(output) => return Ok(output),
-            Err(e) => {
-                eprintln!("cuDNN attention failed, falling back to reference: {}", e);
-                // Fall through to reference implementation
-            }
-        }
+    if !available {
+        return Err(CuDNNError::not_available(
+            "cuDNN is not available on this system",
+        ));
     }
 
-    // Use reference implementation as fallback
-    // For variable length, we need to process each sequence separately
-    let output = reference_attention_varlen_4d(q, k, v, ragged_offset, softmax_scale, causal)
-        .map_err(|e| CuDNNError::internal(e.to_string()))?;
-
-    Ok(output)
+    // Use cuDNN implementation - no fallback to reference
+    cudnn_attention_impl(q, k, v, ragged_offset, softmax_scale, causal)
 }
 
 /// Validate flash-attention compatible inputs (3D tensors)
@@ -327,93 +318,6 @@ pub fn version_info() -> Result<String> {
     Ok("cuDNN version not yet implemented".to_string())
 }
 
-/// Reference attention implementation for variable length sequences
-/// Processes each sequence independently using cumulative lengths and concatenates results
-fn reference_attention_varlen_4d(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    ragged_offset: &Tensor,
-    softmax_scale: f32,
-    causal: bool,
-) -> candle::Result<Tensor> {
-    // Get cumulative lengths from ragged_offset
-    // ragged_offset shape: (batch_size + 1, 1, 1, 1)
-    let cu_seqlens = ragged_offset.flatten_all()?.to_vec1::<u32>()?;
-    let batch_size = cu_seqlens.len() - 1;
-
-    let mut outputs = Vec::new();
-
-    // Process each sequence independently
-    for i in 0..batch_size {
-        let start = cu_seqlens[i] as usize;
-        let end = cu_seqlens[i + 1] as usize;
-        let seq_len = end - start;
-
-        // Extract slices for this sequence
-        // q, k, v have shape: (1, num_heads, total_seq_len, head_dim)
-        let q_slice = q.narrow(2, start, seq_len)?;
-        let k_slice = k.narrow(2, start, seq_len)?;
-        let v_slice = v.narrow(2, start, seq_len)?;
-
-        // Compute attention for this sequence
-        let out_slice =
-            reference_attention_4d(&q_slice, &k_slice, &v_slice, softmax_scale, causal)?;
-        outputs.push(out_slice);
-    }
-
-    // Concatenate all sequence outputs along the sequence dimension (dim 2)
-    Tensor::cat(&outputs, 2)
-}
-
-/// Reference attention implementation (unfused) for comparison and fallback
-/// Works with 4D tensors internally
-fn reference_attention_4d(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    softmax_scale: f32,
-    causal: bool,
-) -> candle::Result<Tensor> {
-    // Q, K, V shapes: (batch, num_heads, seq_len, head_dim)
-    // Compute attention scores: Q @ K^T
-    let k_t = k.transpose(2, 3)?; // (batch, num_heads, head_dim, seq_len)
-    let scores = q.matmul(&k_t)?; // (batch, num_heads, seq_len, seq_len)
-
-    // Scale scores by softmax_scale
-    let scale_tensor = Tensor::new(softmax_scale, q.device())?;
-    let scaled_scores = scores.broadcast_mul(&scale_tensor)?;
-
-    // Apply causal mask if needed
-    let masked_scores = if causal {
-        // Create causal mask: upper triangular (including diagonal) is allowed
-        let seq_len = scores.dim(2)?;
-        let mut mask = vec![f32::NEG_INFINITY; seq_len * seq_len];
-        for i in 0..seq_len {
-            for j in 0..=i {
-                mask[i * seq_len + j] = 0.0;
-            }
-        }
-        let mask_tensor = Tensor::from_vec(mask, (seq_len, seq_len), q.device())?;
-        let mask_tensor = mask_tensor.unsqueeze(0)?.unsqueeze(0)?; // (1, 1, seq_len, seq_len)
-        scaled_scores.broadcast_add(&mask_tensor)?
-    } else {
-        scaled_scores
-    };
-
-    // Softmax: exp(x) / sum(exp(x))
-    let max_val = masked_scores.max_keepdim(3)?;
-    let shifted = masked_scores.broadcast_sub(&max_val)?;
-    let exp_shifted = shifted.exp()?;
-    let sum_exp = exp_shifted.sum_keepdim(3)?;
-    let attn_weights = exp_shifted.broadcast_div(&sum_exp)?;
-
-    // Apply attention weights to values
-    let output = attn_weights.matmul(v)?; // (batch, num_heads, seq_len, head_dim)
-
-    Ok(output)
-}
-
 /// Actual cuDNN attention implementation (4D tensors)
 fn cudnn_attention_impl(
     q: &Tensor,
@@ -445,15 +349,14 @@ fn cudnn_attention_impl(
     let k_tensor = CuDNNTensor::new(k_dims, data_type)?;
     let v_tensor = CuDNNTensor::new(v_dims, data_type)?;
 
-    // For now, use the reference implementation since cuDNN SDPA graph building is complex
-    // This ensures the function works correctly
+    // For now, return an error since cuDNN SDPA graph building is not yet implemented
+    // The reference implementation is available in tests for validation
     drop(q_tensor);
     drop(k_tensor);
     drop(v_tensor);
     drop(graph);
 
-    // Fall back to reference implementation
-    // For variable length, we need to process each sequence separately
-    reference_attention_varlen_4d(q, k, v, ragged_offset, softmax_scale, causal)
-        .map_err(|e| CuDNNError::internal(e.to_string()))
+    Err(CuDNNError::internal(
+        "cuDNN SDPA implementation not yet available.",
+    ))
 }
