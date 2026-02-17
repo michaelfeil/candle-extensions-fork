@@ -204,7 +204,7 @@ impl CuDNNGraph {
 
         // Create scale tensor descriptor
         let scale_data_type = DataType::Float32; // Scale is always float32
-        let scale_dims = vec![1, 1, 1, 1];
+        let scale_dims = vec![1_i64, 1, 1, 1];
         let scale_tensor = CuDNNTensor::new(scale_dims, scale_data_type)?;
 
         // Set scale

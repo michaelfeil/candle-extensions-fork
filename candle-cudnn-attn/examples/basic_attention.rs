@@ -1,6 +1,6 @@
 //! Basic cuDNN attention example with flash-attention compatible API
 
-use candle::{Device, Tensor};
+use candle::{DType, Device, Tensor};
 use candle_cudnn_attn::flash_attn_varlen;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -38,9 +38,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Total tokens: {}", total_tokens);
 
     // Create random tensors in THD format: (total_tokens, num_heads, head_dim)
-    let q = Tensor::randn(0.0, 1.0, (total_tokens, num_heads, head_dim), &device)?;
-    let k = Tensor::randn(0.0, 1.0, (total_tokens, num_heads, head_dim), &device)?;
-    let v = Tensor::randn(0.0, 1.0, (total_tokens, num_heads, head_dim), &device)?;
+    let q = Tensor::randn(0.0f32, 1.0f32, (total_tokens, num_heads, head_dim), &device)?
+        .to_dtype(DType::F16)?;
+    let k = Tensor::randn(0.0f32, 1.0f32, (total_tokens, num_heads, head_dim), &device)?
+        .to_dtype(DType::F16)?;
+    let v = Tensor::randn(0.0f32, 1.0f32, (total_tokens, num_heads, head_dim), &device)?
+        .to_dtype(DType::F16)?;
 
     println!("✅ Created input tensors");
 
@@ -65,7 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &seqlens_q,
         seq_len, // max_seqlen
         1.0 / (head_dim as f32).sqrt(),
-        true, // causal
+        false, // causal
     )?;
 
     let duration = start.elapsed();

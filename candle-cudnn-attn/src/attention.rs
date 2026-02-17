@@ -1,7 +1,6 @@
 //! cuDNN SDPA Attention with THD layout (Total sequences, Heads, Dimension)
 //!
-//! This implementation uses ragged tensors for variable length sequences.
-//! All sequences have the same Q and K lengths (training mode only, no generation).
+//! Native THD varlen cuDNN backend path.
 
 use candle::cuda_backend::WrapErr;
 use candle::{backend::BackendStorage, Layout, Shape, Tensor};
@@ -44,33 +43,71 @@ impl CuDNNAttnTHD {
         let dev = q.device();
         let out_shape = q_l.shape().clone();
 
-        // Get THD dimensions: (total_seq, num_heads, head_dim)
+        if !q_l.is_contiguous() || !_k_l.is_contiguous() || !_v_l.is_contiguous() {
+            candle::bail!("Q/K/V tensors must be contiguous for cuDNN THD attention");
+        }
+
+        // Input is THD: (total_tokens, num_heads, head_dim)
         let dims = q_l.shape().dims();
         if dims.len() != 3 {
             candle::bail!(
-                "Expected 3D THD layout (total_seq, heads, dim), got {:?}",
+                "Expected 3D THD layout (total_tokens, heads, dim), got {:?}",
                 dims
             );
         }
-        let _total_seq = dims[0] as i64;
-        let num_heads = dims[1] as i32;
-        let head_dim = dims[2] as i32;
+        let total_tokens = dims[0] as i64;
+        let num_heads = dims[1] as i64;
+        let head_dim = dims[2] as i64;
 
-        // Get number of sequences from seqlens tensor
-        let (seqlens_storage, seqlens_layout) = self.seqlens.storage_and_layout();
-        let seqlens_cuda = match &*seqlens_storage {
-            candle::Storage::Cuda(c) => c,
-            _ => candle::bail!("seqlens must be a cuda tensor"),
-        };
-        let num_seqs = (seqlens_layout.shape().dims()[0] as i32) - 1; // seqlens has B+1 elements
+        // Decode cumulative sequence lengths.
+        if self.seqlens.shape().dims().len() != 1 {
+            candle::bail!(
+                "seqlens must be 1D with shape (batch + 1,), got {:?}",
+                self.seqlens.shape().dims()
+            );
+        }
+        let cu_seqlens = self.seqlens.to_vec1::<u32>()?;
+        if cu_seqlens.len() < 2 {
+            candle::bail!("seqlens must contain at least 2 elements");
+        }
+        if cu_seqlens[0] != 0 {
+            candle::bail!("seqlens must start at 0, got {}", cu_seqlens[0]);
+        }
+
+        let mut seq_lens = Vec::with_capacity(cu_seqlens.len() - 1);
+        for w in cu_seqlens.windows(2) {
+            if w[1] < w[0] {
+                candle::bail!("seqlens must be non-decreasing, got {:?}", cu_seqlens);
+            }
+            let len = w[1] - w[0];
+            if len > self.max_seqlen as u32 {
+                candle::bail!(
+                    "seqlen {} exceeds max_seqlen {}",
+                    len,
+                    self.max_seqlen
+                );
+            }
+            seq_lens.push(len);
+        }
+        let num_seqs = (cu_seqlens.len() as i64) - 1;
+        if num_seqs <= 0 {
+            candle::bail!("seqlens must contain at least 2 elements");
+        }
+        if cu_seqlens[cu_seqlens.len() - 1] as i64 != total_tokens {
+            candle::bail!(
+                "seqlens must end at total tokens {} (got {})",
+                total_tokens,
+                cu_seqlens[cu_seqlens.len() - 1]
+            );
+        }
 
         // Get data type
         let data_type = match q.dtype() {
             candle::DType::F16 => DataType::Float16,
             candle::DType::BF16 => DataType::BFloat16,
-            candle::DType::F32 => DataType::Float32,
-            dt => candle::bail!("cuDNN attention only supports f16/bf16/f32 ({dt:?})"),
+            dt => candle::bail!("cuDNN attention only supports f16/bf16 ({dt:?})"),
         };
+        let _causal = self.causal;
 
         // Create cuDNN handle
         let mut handle: ffi::cudnnHandle_t = ptr::null_mut();
@@ -79,26 +116,99 @@ impl CuDNNAttnTHD {
             candle::bail!("Failed to create cuDNN handle: {}", result);
         }
 
-        // Create 4D tensor descriptors for cuDNN
-        // Even for THD layout, cuDNN expects 4D: (B, H, S, D)
-        // We use B=1 and rely on ragged offsets for variable lengths
-        let max_seqlen = self.max_seqlen as i32;
+        // Build BHSD descriptors mapped by ragged offsets from THD packed inputs.
+        let max_seqlen = self.max_seqlen as i64;
         let q_dims = vec![num_seqs, num_heads, max_seqlen, head_dim];
-        let k_dims = vec![num_seqs, num_heads, max_seqlen, head_dim];
-        let v_dims = vec![num_seqs, num_heads, max_seqlen, head_dim];
-        let o_dims = vec![num_seqs, num_heads, max_seqlen, head_dim];
+        let kv_dims = vec![num_seqs, num_heads, max_seqlen, head_dim];
+        let bhsd_strides = vec![
+            num_heads * max_seqlen * head_dim, // B
+            max_seqlen * head_dim,             // H
+            head_dim,                          // S
+            1,                    // D
+        ];
 
-        let q_tensor = CuDNNTensor::new(q_dims, data_type)?;
-        let k_tensor = CuDNNTensor::new(k_dims, data_type)?;
-        let v_tensor = CuDNNTensor::new(v_dims, data_type)?;
-        let o_tensor = CuDNNTensor::new(o_dims, data_type)?;
+        const UID_Q: i64 = 101;
+        const UID_K: i64 = 102;
+        const UID_V: i64 = 103;
+        const UID_O: i64 = 104;
+        const UID_SEQ_LEN_Q: i64 = 105;
+        const UID_SEQ_LEN_KV: i64 = 106;
+        const UID_SCALE: i64 = 107;
+        const UID_STATS: i64 = 108;
+        const UID_RAGGED: i64 = 109;
 
-        // Create ragged offset tensor descriptor for seqlens
-        // Shape: (B+1, 1, 1, 1) with cumulative offsets in elements
-        let ragged_dims = vec![num_seqs + 1, 1, 1, 1];
-        let ragged_tensor = CuDNNTensor::new(ragged_dims, DataType::Int32)?;
+        // Ragged offsets in element units for THD packed layout.
+        let token_stride = (num_heads * head_dim) as u32;
+        let ragged_offsets: Vec<i32> = cu_seqlens
+            .iter()
+            .map(|x| x.saturating_mul(token_stride) as i32)
+            .collect();
 
-        // Create SDPA forward operation descriptor
+        let ragged_tensor = CuDNNTensor::new_with_uid_and_strides(
+            vec![num_seqs + 1, 1, 1, 1],
+            vec![1, 1, 1, 1],
+            DataType::Int32,
+            UID_RAGGED,
+        )
+        .map_err(|e| candle::Error::msg(format!("Failed to create ragged descriptor: {e}")))?;
+        let seqlen_q_tensor = CuDNNTensor::new_with_uid_and_strides(
+            vec![num_seqs, 1, 1, 1],
+            vec![1, 1, 1, 1],
+            DataType::Int32,
+            UID_SEQ_LEN_Q,
+        )
+        .map_err(|e| candle::Error::msg(format!("Failed to create seq_len_q descriptor: {e}")))?;
+        let seqlen_kv_tensor = CuDNNTensor::new_with_uid_and_strides(
+            vec![num_seqs, 1, 1, 1],
+            vec![1, 1, 1, 1],
+            DataType::Int32,
+            UID_SEQ_LEN_KV,
+        )
+        .map_err(|e| candle::Error::msg(format!("Failed to create seq_len_kv descriptor: {e}")))?;
+
+        // Q/K/V/O use ragged offsets for THD varlen.
+        let q_tensor = CuDNNTensor::new_with_uid_and_strides_and_ragged(
+            q_dims.clone(),
+            bhsd_strides.clone(),
+            data_type,
+            UID_Q,
+            Some(ragged_tensor.descriptor()),
+        )
+        .map_err(|e| candle::Error::msg(format!("Failed to create Q descriptor: {e}")))?;
+        let k_tensor = CuDNNTensor::new_with_uid_and_strides_and_ragged(
+            kv_dims.clone(),
+            bhsd_strides.clone(),
+            data_type,
+            UID_K,
+            Some(ragged_tensor.descriptor()),
+        )
+        .map_err(|e| candle::Error::msg(format!("Failed to create K descriptor: {e}")))?;
+        let v_tensor = CuDNNTensor::new_with_uid_and_strides_and_ragged(
+            kv_dims,
+            bhsd_strides.clone(),
+            data_type,
+            UID_V,
+            Some(ragged_tensor.descriptor()),
+        )
+        .map_err(|e| candle::Error::msg(format!("Failed to create V descriptor: {e}")))?;
+        let o_tensor = CuDNNTensor::new_with_uid_and_strides_and_ragged(
+            q_dims,
+            bhsd_strides,
+            data_type,
+            UID_O,
+            Some(ragged_tensor.descriptor()),
+        )
+        .map_err(|e| candle::Error::msg(format!("Failed to create O descriptor: {e}")))?;
+        let stats_tensor = CuDNNTensor::new_with_uid_and_strides_and_ragged(
+            vec![num_seqs, num_heads, max_seqlen, 1],
+            vec![num_heads * max_seqlen, max_seqlen, 1, 1],
+            DataType::Float32,
+            UID_STATS,
+            Some(ragged_tensor.descriptor()),
+        )
+        .map_err(|e| candle::Error::msg(format!("Failed to create stats descriptor: {e}")))?;
+
+        // Create SDPA forward operation descriptor.
         let mut sdpa_op: ffi::cudnnBackendDescriptor_t = ptr::null_mut();
         let result = unsafe {
             ffi::cudnnBackendCreateDescriptor(
@@ -165,25 +275,37 @@ impl CuDNNAttnTHD {
             "Failed to set O tensor"
         );
 
-        // Set ragged offsets for variable length sequences
+        set_attr!(
+            sdpa_op,
+            ffi::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_SDPA_FWD_STATSDESC,
+            ffi::cudnnBackendAttributeType_t_CUDNN_TYPE_BACKEND_DESCRIPTOR,
+            &stats_tensor.descriptor(),
+            "Failed to set stats tensor"
+        );
+
         set_attr!(
             sdpa_op,
             ffi::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_SDPA_FWD_SEQ_LEN_QDESC,
             ffi::cudnnBackendAttributeType_t_CUDNN_TYPE_BACKEND_DESCRIPTOR,
-            &ragged_tensor.descriptor(),
-            "Failed to set Q ragged offset"
+            &seqlen_q_tensor.descriptor(),
+            "Failed to set Q seqlen tensor"
         );
-
         set_attr!(
             sdpa_op,
             ffi::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_SDPA_FWD_SEQ_LEN_KVDESC,
             ffi::cudnnBackendAttributeType_t_CUDNN_TYPE_BACKEND_DESCRIPTOR,
-            &ragged_tensor.descriptor(),
-            "Failed to set K/V ragged offset"
+            &seqlen_kv_tensor.descriptor(),
+            "Failed to set KV seqlen tensor"
         );
 
-        // Create and set scale tensor
-        let scale_tensor = CuDNNTensor::new(vec![1, 1, 1, 1], DataType::Float32)?;
+        // Create and set scale tensor (runtime data pointer bound in variant pack).
+        let scale_tensor = CuDNNTensor::new_with_uid_and_strides(
+            vec![1, 1, 1, 1],
+            vec![1, 1, 1, 1],
+            DataType::Float32,
+            UID_SCALE,
+        )
+        .map_err(|e| candle::Error::msg(format!("Failed to create scale descriptor: {e}")))?;
 
         set_attr!(
             sdpa_op,
@@ -235,14 +357,13 @@ impl CuDNNAttnTHD {
         }
 
         // Set operations in operation graph
-        let ops: [*const std::ffi::c_void; 1] = [&sdpa_op as *const _ as *const std::ffi::c_void];
         let result = unsafe {
             ffi::cudnnBackendSetAttribute(
                 op_graph,
                 ffi::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATIONGRAPH_OPS,
                 ffi::cudnnBackendAttributeType_t_CUDNN_TYPE_BACKEND_DESCRIPTOR,
                 1,
-                ops.as_ptr() as *const std::ffi::c_void,
+                &sdpa_op as *const _ as *const std::ffi::c_void,
             )
         };
 
@@ -262,6 +383,107 @@ impl CuDNNAttnTHD {
             candle::bail!("Failed to finalize operation graph: {}", result);
         }
 
+        // Query engine configs from heuristics.
+        let heur_modes = [
+            ffi::cudnnBackendHeurMode_t_CUDNN_HEUR_MODE_INSTANT,
+            ffi::cudnnBackendHeurMode_t_CUDNN_HEUR_MODE_A,
+            ffi::cudnnBackendHeurMode_t_CUDNN_HEUR_MODE_B,
+            ffi::cudnnBackendHeurMode_t_CUDNN_HEUR_MODE_FALLBACK,
+        ];
+        let mut selected_heur_desc: ffi::cudnnBackendDescriptor_t = ptr::null_mut();
+        let mut engine_config: ffi::cudnnBackendDescriptor_t = ptr::null_mut();
+        let mut last_status = ffi::cudnnStatus_t_CUDNN_STATUS_SUCCESS;
+        let mut last_count: i64 = 0;
+
+        for heur_mode in heur_modes {
+            let mut heur_desc: ffi::cudnnBackendDescriptor_t = ptr::null_mut();
+            let result = unsafe {
+                ffi::cudnnBackendCreateDescriptor(
+                    ffi::cudnnBackendDescriptorType_t_CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR,
+                    &mut heur_desc,
+                )
+            };
+            if result != ffi::cudnnStatus_t_CUDNN_STATUS_SUCCESS {
+                last_status = result;
+                continue;
+            }
+
+            let result = unsafe {
+                ffi::cudnnBackendSetAttribute(
+                    heur_desc,
+                    ffi::cudnnBackendAttributeName_t_CUDNN_ATTR_ENGINEHEUR_MODE,
+                    ffi::cudnnBackendAttributeType_t_CUDNN_TYPE_HEUR_MODE,
+                    1,
+                    &heur_mode as *const _ as *const std::ffi::c_void,
+                )
+            };
+            if result != ffi::cudnnStatus_t_CUDNN_STATUS_SUCCESS {
+                last_status = result;
+                unsafe { ffi::cudnnBackendDestroyDescriptor(heur_desc) };
+                continue;
+            }
+
+            let result = unsafe {
+                ffi::cudnnBackendSetAttribute(
+                    heur_desc,
+                    ffi::cudnnBackendAttributeName_t_CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH,
+                    ffi::cudnnBackendAttributeType_t_CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                    1,
+                    &op_graph as *const _ as *const std::ffi::c_void,
+                )
+            };
+            if result != ffi::cudnnStatus_t_CUDNN_STATUS_SUCCESS {
+                last_status = result;
+                unsafe { ffi::cudnnBackendDestroyDescriptor(heur_desc) };
+                continue;
+            }
+
+            let result = unsafe { ffi::cudnnBackendFinalize(heur_desc) };
+            if result != ffi::cudnnStatus_t_CUDNN_STATUS_SUCCESS {
+                last_status = result;
+                unsafe { ffi::cudnnBackendDestroyDescriptor(heur_desc) };
+                continue;
+            }
+
+            let mut engine_configs: Vec<ffi::cudnnBackendDescriptor_t> = vec![ptr::null_mut(); 8];
+            let mut engine_config_count: i64 = 0;
+            let result = unsafe {
+                ffi::cudnnBackendGetAttribute(
+                    heur_desc,
+                    ffi::cudnnBackendAttributeName_t_CUDNN_ATTR_ENGINEHEUR_RESULTS,
+                    ffi::cudnnBackendAttributeType_t_CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                    engine_configs.len() as i64,
+                    &mut engine_config_count as *mut i64,
+                    engine_configs.as_mut_ptr() as *mut std::ffi::c_void,
+                )
+            };
+            last_status = result;
+            last_count = engine_config_count;
+            if result == ffi::cudnnStatus_t_CUDNN_STATUS_SUCCESS
+                && engine_config_count > 0
+                && !engine_configs[0].is_null()
+            {
+                engine_config = engine_configs[0];
+                selected_heur_desc = heur_desc;
+                break;
+            }
+
+            if !selected_heur_desc.is_null() {
+                unsafe { ffi::cudnnBackendDestroyDescriptor(selected_heur_desc) };
+            }
+        }
+
+        if engine_config.is_null() {
+            unsafe { ffi::cudnnBackendDestroyDescriptor(op_graph) };
+            unsafe { ffi::cudnnBackendDestroyDescriptor(sdpa_op) };
+            unsafe { ffi::cudnnDestroy(handle) };
+            candle::bail!(
+                "Failed to query engine configs from heuristics: status={}, count={}",
+                last_status,
+                last_count
+            );
+        }
+
         // Create execution plan
         let mut exec_plan: ffi::cudnnBackendDescriptor_t = ptr::null_mut();
         let result = unsafe {
@@ -272,6 +494,9 @@ impl CuDNNAttnTHD {
         };
 
         if result != ffi::cudnnStatus_t_CUDNN_STATUS_SUCCESS {
+            if !selected_heur_desc.is_null() {
+                unsafe { ffi::cudnnBackendDestroyDescriptor(selected_heur_desc) };
+            }
             unsafe { ffi::cudnnBackendDestroyDescriptor(op_graph) };
             unsafe { ffi::cudnnBackendDestroyDescriptor(sdpa_op) };
             unsafe { ffi::cudnnDestroy(handle) };
@@ -291,20 +516,45 @@ impl CuDNNAttnTHD {
 
         if result != ffi::cudnnStatus_t_CUDNN_STATUS_SUCCESS {
             unsafe { ffi::cudnnBackendDestroyDescriptor(exec_plan) };
+            if !selected_heur_desc.is_null() {
+                unsafe { ffi::cudnnBackendDestroyDescriptor(selected_heur_desc) };
+            }
             unsafe { ffi::cudnnBackendDestroyDescriptor(op_graph) };
             unsafe { ffi::cudnnBackendDestroyDescriptor(sdpa_op) };
             unsafe { ffi::cudnnDestroy(handle) };
             candle::bail!("Failed to set handle in execution plan: {}", result);
         }
 
+        let result = unsafe {
+            ffi::cudnnBackendSetAttribute(
+                exec_plan,
+                ffi::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG,
+                ffi::cudnnBackendAttributeType_t_CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                1,
+                &engine_config as *const _ as *const std::ffi::c_void,
+            )
+        };
+        if result != ffi::cudnnStatus_t_CUDNN_STATUS_SUCCESS {
+            unsafe { ffi::cudnnBackendDestroyDescriptor(exec_plan) };
+            unsafe { ffi::cudnnBackendDestroyDescriptor(selected_heur_desc) };
+            unsafe { ffi::cudnnBackendDestroyDescriptor(op_graph) };
+            unsafe { ffi::cudnnBackendDestroyDescriptor(sdpa_op) };
+            unsafe { ffi::cudnnDestroy(handle) };
+            candle::bail!("Failed to set engine config in execution plan: {}", result);
+        }
+
         // Finalize execution plan
         let result = unsafe { ffi::cudnnBackendFinalize(exec_plan) };
         if result != ffi::cudnnStatus_t_CUDNN_STATUS_SUCCESS {
             unsafe { ffi::cudnnBackendDestroyDescriptor(exec_plan) };
+            unsafe { ffi::cudnnBackendDestroyDescriptor(selected_heur_desc) };
             unsafe { ffi::cudnnBackendDestroyDescriptor(op_graph) };
             unsafe { ffi::cudnnBackendDestroyDescriptor(sdpa_op) };
             unsafe { ffi::cudnnDestroy(handle) };
             candle::bail!("Failed to finalize execution plan: {}", result);
+        }
+        if !selected_heur_desc.is_null() {
+            unsafe { ffi::cudnnBackendDestroyDescriptor(selected_heur_desc) };
         }
 
         // Get workspace size
@@ -340,17 +590,26 @@ impl CuDNNAttnTHD {
         // Allocate output tensor
         let elem_count = out_shape.elem_count();
         let dst = unsafe { dev.alloc::<T>(elem_count) }.w()?;
+        let stats_elem_count = (num_seqs * num_heads * max_seqlen) as usize;
+        let stats_dst = unsafe { dev.alloc::<f32>(stats_elem_count.max(1)) }.w()?;
 
         // Get device pointers
         let q_ptr = *q.as_cuda_slice::<T>()?.device_ptr() as *const core::ffi::c_void;
         let k_ptr = *k.as_cuda_slice::<T>()?.device_ptr() as *const core::ffi::c_void;
         let v_ptr = *v.as_cuda_slice::<T>()?.device_ptr() as *const core::ffi::c_void;
         let o_ptr = *dst.device_ptr() as *const core::ffi::c_void;
+        let stats_ptr = *stats_dst.device_ptr() as *const core::ffi::c_void;
         let workspace_ptr = *workspace.device_ptr() as *const core::ffi::c_void;
 
-        // Get seqlens device pointer
-        let _seqlens_ptr =
-            *seqlens_cuda.as_cuda_slice::<u32>()?.device_ptr() as *const core::ffi::c_void;
+        let seq_lens_i32: Vec<i32> = seq_lens.into_iter().map(|x| x as i32).collect();
+        let seqlen_q_dev = dev.htod_copy(seq_lens_i32.clone()).w()?;
+        let seqlen_kv_dev = dev.htod_copy(seq_lens_i32).w()?;
+        let ragged_dev = dev.htod_copy(ragged_offsets).w()?;
+        let seqlen_q_ptr = *seqlen_q_dev.device_ptr() as *const core::ffi::c_void;
+        let seqlen_kv_ptr = *seqlen_kv_dev.device_ptr() as *const core::ffi::c_void;
+        let ragged_ptr = *ragged_dev.device_ptr() as *const core::ffi::c_void;
+        let scale = dev.htod_copy(vec![self.softmax_scale]).w()?;
+        let scale_ptr = *scale.device_ptr() as *const core::ffi::c_void;
 
         // Create variant pack
         let mut variant_pack: ffi::cudnnBackendDescriptor_t = ptr::null_mut();
@@ -369,14 +628,35 @@ impl CuDNNAttnTHD {
             candle::bail!("Failed to create variant pack: {}", result);
         }
 
-        // Set tensor pointers in variant pack
-        let tensor_ptrs: [*const std::ffi::c_void; 4] = [q_ptr, k_ptr, v_ptr, o_ptr];
+        // Set tensor pointers in variant pack.
+        let tensor_ptrs: [*const std::ffi::c_void; 9] = [
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            o_ptr,
+            stats_ptr,
+            seqlen_q_ptr,
+            seqlen_kv_ptr,
+            ragged_ptr,
+            scale_ptr,
+        ];
+        let tensor_uids: [i64; 9] = [
+            q_tensor.uid(),
+            k_tensor.uid(),
+            v_tensor.uid(),
+            o_tensor.uid(),
+            stats_tensor.uid(),
+            seqlen_q_tensor.uid(),
+            seqlen_kv_tensor.uid(),
+            ragged_tensor.uid(),
+            scale_tensor.uid(),
+        ];
         let result = unsafe {
             ffi::cudnnBackendSetAttribute(
                 variant_pack,
                 ffi::cudnnBackendAttributeName_t_CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS,
                 ffi::cudnnBackendAttributeType_t_CUDNN_TYPE_VOID_PTR,
-                4,
+                tensor_ptrs.len() as i64,
                 tensor_ptrs.as_ptr() as *const std::ffi::c_void,
             )
         };
@@ -388,6 +668,24 @@ impl CuDNNAttnTHD {
             unsafe { ffi::cudnnBackendDestroyDescriptor(sdpa_op) };
             unsafe { ffi::cudnnDestroy(handle) };
             candle::bail!("Failed to set tensor pointers: {}", result);
+        }
+
+        let result = unsafe {
+            ffi::cudnnBackendSetAttribute(
+                variant_pack,
+                ffi::cudnnBackendAttributeName_t_CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS,
+                ffi::cudnnBackendAttributeType_t_CUDNN_TYPE_INT64,
+                tensor_uids.len() as i64,
+                tensor_uids.as_ptr() as *const std::ffi::c_void,
+            )
+        };
+        if result != ffi::cudnnStatus_t_CUDNN_STATUS_SUCCESS {
+            unsafe { ffi::cudnnBackendDestroyDescriptor(variant_pack) };
+            unsafe { ffi::cudnnBackendDestroyDescriptor(exec_plan) };
+            unsafe { ffi::cudnnBackendDestroyDescriptor(op_graph) };
+            unsafe { ffi::cudnnBackendDestroyDescriptor(sdpa_op) };
+            unsafe { ffi::cudnnDestroy(handle) };
+            candle::bail!("Failed to set tensor unique IDs: {}", result);
         }
 
         // Set workspace pointer
@@ -473,10 +771,9 @@ impl candle::CustomOp3 for CuDNNAttnTHD {
         v_l: &Layout,
     ) -> candle::Result<(candle::CudaStorage, Shape)> {
         match q.dtype() {
-            candle::DType::F32 => self.cuda_fwd_t::<f32>(q, q_l, k, k_l, v, v_l),
             candle::DType::F16 => self.cuda_fwd_t::<half::f16>(q, q_l, k, k_l, v, v_l),
             candle::DType::BF16 => self.cuda_fwd_t::<half::bf16>(q, q_l, k, k_l, v, v_l),
-            dt => candle::bail!("cuDNN attention only supports f32/f16/bf16 ({dt:?})"),
+            dt => candle::bail!("cuDNN attention only supports f16/bf16 ({dt:?})"),
         }
     }
 }
@@ -543,6 +840,20 @@ pub fn flash_attn_varlen(
             v_dims[2]
         );
     }
+    if max_seqlen == 0 {
+        candle::bail!("max_seqlen must be > 0");
+    }
+
+    let seqlens_dims = seqlens.shape().dims();
+    if seqlens_dims.len() != 1 || seqlens_dims[0] < 2 {
+        candle::bail!(
+            "Expected seqlens shape (batch + 1,) with at least 2 elements, got {:?}",
+            seqlens_dims
+        );
+    }
+    if seqlens.dtype() != candle::DType::U32 {
+        candle::bail!("seqlens must be U32, got {:?}", seqlens.dtype());
+    }
 
     let op = CuDNNAttnTHD {
         softmax_scale,
@@ -550,7 +861,6 @@ pub fn flash_attn_varlen(
         max_seqlen,
         seqlens: seqlens.clone(),
     };
-
     q.apply_op3(k, v, op)
 }
 
