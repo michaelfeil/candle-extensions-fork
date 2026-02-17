@@ -37,10 +37,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Head dimension: {}", head_dim);
     println!("  Total tokens: {}", total_tokens);
 
-    // Create random tensors in 3D format: (num_heads, total_tokens, head_dim)
-    let q = Tensor::randn(0.0, 1.0, (num_heads, total_tokens, head_dim), &device)?;
-    let k = Tensor::randn(0.0, 1.0, (num_heads, total_tokens, head_dim), &device)?;
-    let v = Tensor::randn(0.0, 1.0, (num_heads, total_tokens, head_dim), &device)?;
+    // Create random tensors in THD format: (total_tokens, num_heads, head_dim)
+    let q = Tensor::randn(0.0, 1.0, (total_tokens, num_heads, head_dim), &device)?;
+    let k = Tensor::randn(0.0, 1.0, (total_tokens, num_heads, head_dim), &device)?;
+    let v = Tensor::randn(0.0, 1.0, (total_tokens, num_heads, head_dim), &device)?;
 
     println!("✅ Created input tensors");
 
@@ -52,7 +52,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let seqlens_q = Tensor::new(&seqlens[..], &device)?;
-    let seqlens_k = Tensor::new(&seqlens[..], &device)?;
     println!("✅ Created cumulative sequence lengths (cu_seqlens)");
 
     // Run attention
@@ -64,9 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &k,
         &v,
         &seqlens_q,
-        &seqlens_k,
-        seq_len, // max_seqlen_q
-        seq_len, // max_seqlen_k
+        seq_len, // max_seqlen
         1.0 / (head_dim as f32).sqrt(),
         true, // causal
     )?;

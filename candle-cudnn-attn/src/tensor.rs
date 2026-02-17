@@ -39,55 +39,118 @@ impl DataType {
     }
 }
 
-/// cuDNN tensor descriptor wrapper
+/// cuDNN backend tensor descriptor wrapper for graph API
 pub struct CuDNNTensor {
-    pub(crate) desc: ffi::cudnnTensorDescriptor_t,
+    pub(crate) backend_desc: ffi::cudnnBackendDescriptor_t,
     pub(crate) dims: Vec<i32>,
     pub(crate) data_type: DataType,
 }
 
 impl CuDNNTensor {
-    /// Create a new tensor descriptor
+    /// Create a new backend tensor descriptor for graph API
     pub fn new(dims: Vec<i32>, data_type: DataType) -> Result<Self> {
-        let mut desc: ffi::cudnnTensorDescriptor_t = ptr::null_mut();
+        let mut backend_desc: ffi::cudnnBackendDescriptor_t = ptr::null_mut();
 
-        let result = unsafe { ffi::cudnnCreateTensorDescriptor(&mut desc) };
-        if result != ffi::cudnnStatus_t_CUDNN_STATUS_SUCCESS {
-            return Err(CuDNNError::cudnn_error(
-                result as i32,
-                "Failed to create tensor descriptor",
-            ));
-        }
-
-        // Set tensor descriptor
+        // Create backend tensor descriptor
         let result = unsafe {
-            ffi::cudnnSetTensorNdDescriptor(
-                desc,
-                data_type.to_cudnn(),
-                dims.len() as i32,
-                dims.as_ptr(),
-                dims.as_ptr(), // strides - using same as dims for now
+            ffi::cudnnBackendCreateDescriptor(
+                ffi::cudnnBackendDescriptorType_t_CUDNN_BACKEND_TENSOR_DESCRIPTOR,
+                &mut backend_desc,
             )
         };
 
         if result != ffi::cudnnStatus_t_CUDNN_STATUS_SUCCESS {
-            unsafe { ffi::cudnnDestroyTensorDescriptor(desc) };
             return Err(CuDNNError::cudnn_error(
                 result as i32,
-                "Failed to set tensor descriptor",
+                "Failed to create backend tensor descriptor",
+            ));
+        }
+
+        // Set data type
+        let cudnn_dtype = data_type.to_cudnn();
+        let result = unsafe {
+            ffi::cudnnBackendSetAttribute(
+                backend_desc,
+                ffi::cudnnBackendAttributeName_t_CUDNN_ATTR_TENSOR_DATA_TYPE,
+                ffi::cudnnBackendAttributeType_t_CUDNN_TYPE_DATA_TYPE,
+                1,
+                &cudnn_dtype as *const _ as *const std::ffi::c_void,
+            )
+        };
+
+        if result != ffi::cudnnStatus_t_CUDNN_STATUS_SUCCESS {
+            unsafe { ffi::cudnnBackendDestroyDescriptor(backend_desc) };
+            return Err(CuDNNError::cudnn_error(
+                result as i32,
+                "Failed to set tensor data type",
+            ));
+        }
+
+        // Set dimensions
+        let result = unsafe {
+            ffi::cudnnBackendSetAttribute(
+                backend_desc,
+                ffi::cudnnBackendAttributeName_t_CUDNN_ATTR_TENSOR_DIMENSIONS,
+                ffi::cudnnBackendAttributeType_t_CUDNN_TYPE_INT64,
+                dims.len() as i64,
+                dims.as_ptr() as *const std::ffi::c_void,
+            )
+        };
+
+        if result != ffi::cudnnStatus_t_CUDNN_STATUS_SUCCESS {
+            unsafe { ffi::cudnnBackendDestroyDescriptor(backend_desc) };
+            return Err(CuDNNError::cudnn_error(
+                result as i32,
+                "Failed to set tensor dimensions",
+            ));
+        }
+
+        // Set strides (row-major layout)
+        let mut strides = vec![0i64; dims.len()];
+        let mut stride = 1i64;
+        for i in (0..dims.len()).rev() {
+            strides[i] = stride;
+            stride *= dims[i] as i64;
+        }
+
+        let result = unsafe {
+            ffi::cudnnBackendSetAttribute(
+                backend_desc,
+                ffi::cudnnBackendAttributeName_t_CUDNN_ATTR_TENSOR_STRIDES,
+                ffi::cudnnBackendAttributeType_t_CUDNN_TYPE_INT64,
+                strides.len() as i64,
+                strides.as_ptr() as *const std::ffi::c_void,
+            )
+        };
+
+        if result != ffi::cudnnStatus_t_CUDNN_STATUS_SUCCESS {
+            unsafe { ffi::cudnnBackendDestroyDescriptor(backend_desc) };
+            return Err(CuDNNError::cudnn_error(
+                result as i32,
+                "Failed to set tensor strides",
+            ));
+        }
+
+        // Finalize the descriptor
+        let result = unsafe { ffi::cudnnBackendFinalize(backend_desc) };
+        if result != ffi::cudnnStatus_t_CUDNN_STATUS_SUCCESS {
+            unsafe { ffi::cudnnBackendDestroyDescriptor(backend_desc) };
+            return Err(CuDNNError::cudnn_error(
+                result as i32,
+                "Failed to finalize tensor descriptor",
             ));
         }
 
         Ok(Self {
-            desc,
+            backend_desc,
             dims,
             data_type,
         })
     }
 
-    /// Get the underlying descriptor
-    pub fn desc(&self) -> ffi::cudnnTensorDescriptor_t {
-        self.desc
+    /// Get the underlying backend descriptor
+    pub fn descriptor(&self) -> ffi::cudnnBackendDescriptor_t {
+        self.backend_desc
     }
 
     /// Get dimensions
@@ -104,8 +167,8 @@ impl CuDNNTensor {
 impl Drop for CuDNNTensor {
     fn drop(&mut self) {
         unsafe {
-            if !self.desc.is_null() {
-                ffi::cudnnDestroyTensorDescriptor(self.desc);
+            if !self.backend_desc.is_null() {
+                ffi::cudnnBackendDestroyDescriptor(self.backend_desc);
             }
         }
     }
