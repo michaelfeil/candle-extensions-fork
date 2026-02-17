@@ -24,10 +24,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("📱 Using CUDA device: {:?}", device);
 
     // Create test tensors in 3D format (flash-attention compatible)
-    let num_heads = 8;
+    let num_heads = 2;
     let batch_size = 4;
-    let seq_len = 128;
-    let head_dim = 64;
+    let seq_len = 32;
+    let head_dim = 32;
     let total_tokens = batch_size * seq_len;
 
     println!("\n📊 Tensor Configuration:");

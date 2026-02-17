@@ -120,11 +120,12 @@ impl CuDNNAttnTHD {
         let max_seqlen = self.max_seqlen as i64;
         let q_dims = vec![num_seqs, num_heads, max_seqlen, head_dim];
         let kv_dims = vec![num_seqs, num_heads, max_seqlen, head_dim];
+        // Packed THD storage with logical BHSD dims uses BSHD strides.
         let bhsd_strides = vec![
-            num_heads * max_seqlen * head_dim, // B
-            max_seqlen * head_dim,             // H
-            head_dim,                          // S
-            1,                    // D
+            max_seqlen * num_heads * head_dim, // B
+            head_dim,                          // H
+            num_heads * head_dim,              // S
+            1,                                 // D
         ];
 
         const UID_Q: i64 = 101;
@@ -134,23 +135,57 @@ impl CuDNNAttnTHD {
         const UID_SEQ_LEN_Q: i64 = 105;
         const UID_SEQ_LEN_KV: i64 = 106;
         const UID_SCALE: i64 = 107;
-        const UID_STATS: i64 = 108;
-        const UID_RAGGED: i64 = 109;
+        const UID_Q_RAGGED: i64 = 109;
+        const UID_K_RAGGED: i64 = 110;
+        const UID_V_RAGGED: i64 = 111;
+        const UID_O_RAGGED: i64 = 112;
 
         // Ragged offsets in element units for THD packed layout.
-        let token_stride = (num_heads * head_dim) as u32;
-        let ragged_offsets: Vec<i32> = cu_seqlens
+        let q_ragged_offsets: Vec<i64> = cu_seqlens
             .iter()
-            .map(|x| x.saturating_mul(token_stride) as i32)
+            .map(|x| (*x as i64) * num_heads * head_dim)
+            .collect();
+        let k_ragged_offsets: Vec<i64> = cu_seqlens
+            .iter()
+            .map(|x| (*x as i64) * num_heads * head_dim)
+            .collect();
+        let v_ragged_offsets: Vec<i64> = cu_seqlens
+            .iter()
+            .map(|x| (*x as i64) * num_heads * head_dim)
+            .collect();
+        let o_ragged_offsets: Vec<i64> = cu_seqlens
+            .iter()
+            .map(|x| (*x as i64) * num_heads * head_dim)
             .collect();
 
-        let ragged_tensor = CuDNNTensor::new_with_uid_and_strides(
+        let q_ragged_tensor = CuDNNTensor::new_with_uid_and_strides(
             vec![num_seqs + 1, 1, 1, 1],
             vec![1, 1, 1, 1],
-            DataType::Int32,
-            UID_RAGGED,
+            DataType::Int64,
+            UID_Q_RAGGED,
         )
-        .map_err(|e| candle::Error::msg(format!("Failed to create ragged descriptor: {e}")))?;
+        .map_err(|e| candle::Error::msg(format!("Failed to create q ragged descriptor: {e}")))?;
+        let k_ragged_tensor = CuDNNTensor::new_with_uid_and_strides(
+            vec![num_seqs + 1, 1, 1, 1],
+            vec![1, 1, 1, 1],
+            DataType::Int64,
+            UID_K_RAGGED,
+        )
+        .map_err(|e| candle::Error::msg(format!("Failed to create k ragged descriptor: {e}")))?;
+        let v_ragged_tensor = CuDNNTensor::new_with_uid_and_strides(
+            vec![num_seqs + 1, 1, 1, 1],
+            vec![1, 1, 1, 1],
+            DataType::Int64,
+            UID_V_RAGGED,
+        )
+        .map_err(|e| candle::Error::msg(format!("Failed to create v ragged descriptor: {e}")))?;
+        let o_ragged_tensor = CuDNNTensor::new_with_uid_and_strides(
+            vec![num_seqs + 1, 1, 1, 1],
+            vec![1, 1, 1, 1],
+            DataType::Int64,
+            UID_O_RAGGED,
+        )
+        .map_err(|e| candle::Error::msg(format!("Failed to create o ragged descriptor: {e}")))?;
         let seqlen_q_tensor = CuDNNTensor::new_with_uid_and_strides(
             vec![num_seqs, 1, 1, 1],
             vec![1, 1, 1, 1],
@@ -172,7 +207,7 @@ impl CuDNNAttnTHD {
             bhsd_strides.clone(),
             data_type,
             UID_Q,
-            Some(ragged_tensor.descriptor()),
+            Some(q_ragged_tensor.descriptor()),
         )
         .map_err(|e| candle::Error::msg(format!("Failed to create Q descriptor: {e}")))?;
         let k_tensor = CuDNNTensor::new_with_uid_and_strides_and_ragged(
@@ -180,7 +215,7 @@ impl CuDNNAttnTHD {
             bhsd_strides.clone(),
             data_type,
             UID_K,
-            Some(ragged_tensor.descriptor()),
+            Some(k_ragged_tensor.descriptor()),
         )
         .map_err(|e| candle::Error::msg(format!("Failed to create K descriptor: {e}")))?;
         let v_tensor = CuDNNTensor::new_with_uid_and_strides_and_ragged(
@@ -188,7 +223,7 @@ impl CuDNNAttnTHD {
             bhsd_strides.clone(),
             data_type,
             UID_V,
-            Some(ragged_tensor.descriptor()),
+            Some(v_ragged_tensor.descriptor()),
         )
         .map_err(|e| candle::Error::msg(format!("Failed to create V descriptor: {e}")))?;
         let o_tensor = CuDNNTensor::new_with_uid_and_strides_and_ragged(
@@ -196,17 +231,9 @@ impl CuDNNAttnTHD {
             bhsd_strides,
             data_type,
             UID_O,
-            Some(ragged_tensor.descriptor()),
+            Some(o_ragged_tensor.descriptor()),
         )
         .map_err(|e| candle::Error::msg(format!("Failed to create O descriptor: {e}")))?;
-        let stats_tensor = CuDNNTensor::new_with_uid_and_strides_and_ragged(
-            vec![num_seqs, num_heads, max_seqlen, 1],
-            vec![num_heads * max_seqlen, max_seqlen, 1, 1],
-            DataType::Float32,
-            UID_STATS,
-            Some(ragged_tensor.descriptor()),
-        )
-        .map_err(|e| candle::Error::msg(format!("Failed to create stats descriptor: {e}")))?;
 
         // Create SDPA forward operation descriptor.
         let mut sdpa_op: ffi::cudnnBackendDescriptor_t = ptr::null_mut();
@@ -273,14 +300,6 @@ impl CuDNNAttnTHD {
             ffi::cudnnBackendAttributeType_t_CUDNN_TYPE_BACKEND_DESCRIPTOR,
             &o_tensor.descriptor(),
             "Failed to set O tensor"
-        );
-
-        set_attr!(
-            sdpa_op,
-            ffi::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_SDPA_FWD_STATSDESC,
-            ffi::cudnnBackendAttributeType_t_CUDNN_TYPE_BACKEND_DESCRIPTOR,
-            &stats_tensor.descriptor(),
-            "Failed to set stats tensor"
         );
 
         set_attr!(
@@ -468,9 +487,7 @@ impl CuDNNAttnTHD {
                 break;
             }
 
-            if !selected_heur_desc.is_null() {
-                unsafe { ffi::cudnnBackendDestroyDescriptor(selected_heur_desc) };
-            }
+            unsafe { ffi::cudnnBackendDestroyDescriptor(heur_desc) };
         }
 
         if engine_config.is_null() {
@@ -590,24 +607,27 @@ impl CuDNNAttnTHD {
         // Allocate output tensor
         let elem_count = out_shape.elem_count();
         let dst = unsafe { dev.alloc::<T>(elem_count) }.w()?;
-        let stats_elem_count = (num_seqs * num_heads * max_seqlen) as usize;
-        let stats_dst = unsafe { dev.alloc::<f32>(stats_elem_count.max(1)) }.w()?;
 
         // Get device pointers
         let q_ptr = *q.as_cuda_slice::<T>()?.device_ptr() as *const core::ffi::c_void;
         let k_ptr = *k.as_cuda_slice::<T>()?.device_ptr() as *const core::ffi::c_void;
         let v_ptr = *v.as_cuda_slice::<T>()?.device_ptr() as *const core::ffi::c_void;
         let o_ptr = *dst.device_ptr() as *const core::ffi::c_void;
-        let stats_ptr = *stats_dst.device_ptr() as *const core::ffi::c_void;
         let workspace_ptr = *workspace.device_ptr() as *const core::ffi::c_void;
 
         let seq_lens_i32: Vec<i32> = seq_lens.into_iter().map(|x| x as i32).collect();
         let seqlen_q_dev = dev.htod_copy(seq_lens_i32.clone()).w()?;
         let seqlen_kv_dev = dev.htod_copy(seq_lens_i32).w()?;
-        let ragged_dev = dev.htod_copy(ragged_offsets).w()?;
+        let q_ragged_dev = dev.htod_copy(q_ragged_offsets).w()?;
+        let k_ragged_dev = dev.htod_copy(k_ragged_offsets).w()?;
+        let v_ragged_dev = dev.htod_copy(v_ragged_offsets).w()?;
+        let o_ragged_dev = dev.htod_copy(o_ragged_offsets).w()?;
         let seqlen_q_ptr = *seqlen_q_dev.device_ptr() as *const core::ffi::c_void;
         let seqlen_kv_ptr = *seqlen_kv_dev.device_ptr() as *const core::ffi::c_void;
-        let ragged_ptr = *ragged_dev.device_ptr() as *const core::ffi::c_void;
+        let q_ragged_ptr = *q_ragged_dev.device_ptr() as *const core::ffi::c_void;
+        let k_ragged_ptr = *k_ragged_dev.device_ptr() as *const core::ffi::c_void;
+        let v_ragged_ptr = *v_ragged_dev.device_ptr() as *const core::ffi::c_void;
+        let o_ragged_ptr = *o_ragged_dev.device_ptr() as *const core::ffi::c_void;
         let scale = dev.htod_copy(vec![self.softmax_scale]).w()?;
         let scale_ptr = *scale.device_ptr() as *const core::ffi::c_void;
 
@@ -629,26 +649,30 @@ impl CuDNNAttnTHD {
         }
 
         // Set tensor pointers in variant pack.
-        let tensor_ptrs: [*const std::ffi::c_void; 9] = [
+        let tensor_ptrs: [*const std::ffi::c_void; 11] = [
             q_ptr,
             k_ptr,
             v_ptr,
             o_ptr,
-            stats_ptr,
             seqlen_q_ptr,
             seqlen_kv_ptr,
-            ragged_ptr,
+            q_ragged_ptr,
+            k_ragged_ptr,
+            v_ragged_ptr,
+            o_ragged_ptr,
             scale_ptr,
         ];
-        let tensor_uids: [i64; 9] = [
+        let tensor_uids: [i64; 11] = [
             q_tensor.uid(),
             k_tensor.uid(),
             v_tensor.uid(),
             o_tensor.uid(),
-            stats_tensor.uid(),
             seqlen_q_tensor.uid(),
             seqlen_kv_tensor.uid(),
-            ragged_tensor.uid(),
+            q_ragged_tensor.uid(),
+            k_ragged_tensor.uid(),
+            v_ragged_tensor.uid(),
+            o_ragged_tensor.uid(),
             scale_tensor.uid(),
         ];
         let result = unsafe {

@@ -15,6 +15,7 @@ pub enum DataType {
     Float32,
     Float16,
     BFloat16,
+    Int64,
     Int32,
     Int8,
 }
@@ -26,6 +27,7 @@ impl DataType {
             DataType::Float32 => ffi::cudnnDataType_t_CUDNN_DATA_FLOAT,
             DataType::Float16 => ffi::cudnnDataType_t_CUDNN_DATA_HALF,
             DataType::BFloat16 => ffi::cudnnDataType_t_CUDNN_DATA_BFLOAT16,
+            DataType::Int64 => ffi::cudnnDataType_t_CUDNN_DATA_INT64,
             DataType::Int32 => ffi::cudnnDataType_t_CUDNN_DATA_INT32,
             DataType::Int8 => ffi::cudnnDataType_t_CUDNN_DATA_INT8,
         }
