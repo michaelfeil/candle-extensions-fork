@@ -23,6 +23,9 @@ unsafe extern "C" {
     ) -> i32;
 
     fn cudnn_thd_last_error() -> *const core::ffi::c_char;
+    fn cudnn_thd_cache_plan_count() -> i64;
+    fn cudnn_thd_cache_workspace_bytes() -> i64;
+    fn cudnn_thd_cuda_mem_info(free_bytes: *mut i64, total_bytes: *mut i64) -> i32;
 }
 
 pub(crate) struct ThdSdpaFwdParams {
@@ -82,5 +85,26 @@ pub(crate) fn run_thd_sdpa_fwd(params: &ThdSdpaFwdParams) -> Result<(), String> 
             }
         };
         Err(msg)
+    }
+}
+
+pub fn cache_plan_count() -> usize {
+    let v = unsafe { cudnn_thd_cache_plan_count() };
+    if v < 0 { 0 } else { v as usize }
+}
+
+pub fn cache_workspace_bytes() -> usize {
+    let v = unsafe { cudnn_thd_cache_workspace_bytes() };
+    if v < 0 { 0 } else { v as usize }
+}
+
+pub fn cuda_mem_info() -> Result<(usize, usize), String> {
+    let mut free_b = 0i64;
+    let mut total_b = 0i64;
+    let rc = unsafe { cudnn_thd_cuda_mem_info(&mut free_b as *mut i64, &mut total_b as *mut i64) };
+    if rc == 0 {
+        Ok((free_b.max(0) as usize, total_b.max(0) as usize))
+    } else {
+        Err("cudaMemGetInfo failed".to_string())
     }
 }

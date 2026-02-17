@@ -5,6 +5,7 @@
 #include <cudnn_frontend.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <list>
 #include <memory>
@@ -16,6 +17,7 @@
 #include "cudnn_frontend_Heuristics.h"
 #include "cudnn_frontend_find_plan.h"
 #include "cudnn_frontend/graph_interface.h"
+#include "cudnn_frontend/backend/kernel_cache.h"
 
 namespace {
 thread_local std::string g_last_error;
@@ -60,6 +62,7 @@ struct CacheKeyHash {
 struct CacheEntry {
     std::shared_ptr<cudnn_frontend::graph::Graph> graph;
     void* workspace = nullptr;
+    int64_t workspace_bytes = 0;
 };
 
 struct CacheValue {
@@ -71,6 +74,7 @@ struct ThreadContext {
     static constexpr std::size_t kMaxPlans = 2048;
 
     cudnnHandle_t handle = nullptr;
+    std::shared_ptr<cudnn_frontend::KernelCache> kernel_cache;
     std::unordered_map<CacheKey, CacheValue, CacheKeyHash> cache;
     std::list<CacheKey> lru;
 
@@ -88,13 +92,33 @@ struct ThreadContext {
 
 thread_local ThreadContext g_ctx;
 
-CacheEntry build_cache_entry(cudnnHandle_t handle, const CacheKey& key, float attn_scale) {
+bool dynamic_kernel_cache_enabled() {
+    static int enabled = []() {
+        const char* v = std::getenv("CUDNN_THD_DYNAMIC_KERNEL_CACHE");
+        if (!v) {
+            return 1;
+        }
+        return (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 || std::strcmp(v, "FALSE") == 0) ? 0
+                                                                                                              : 1;
+    }();
+    return enabled != 0;
+}
+
+CacheEntry build_cache_entry(ThreadContext& ctx, const CacheKey& key, float attn_scale) {
     namespace fe = cudnn_frontend;
     CacheEntry entry;
     entry.graph = std::make_shared<fe::graph::Graph>();
     entry.graph->set_io_data_type(key.is_bf16 ? fe::DataType_t::BFLOAT16 : fe::DataType_t::HALF)
         .set_intermediate_data_type(fe::DataType_t::FLOAT)
         .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    // Try to use dynamic-kernel-cache path to reduce first-build latency for shape churn.
+    if (dynamic_kernel_cache_enabled()) {
+        if (!ctx.kernel_cache) {
+            ctx.kernel_cache = std::make_shared<fe::KernelCache>();
+        }
+        entry.graph->set_dynamic_shape_enabled(true).set_kernel_cache(ctx.kernel_cache);
+    }
 
     constexpr int64_t Q_UID = 1;
     constexpr int64_t K_UID = 2;
@@ -188,7 +212,7 @@ CacheEntry build_cache_entry(cudnnHandle_t handle, const CacheKey& key, float at
 
     // Favor heuristics-A engines for steady-state speed.
     std::vector<fe::HeurMode_t> modes = {fe::HeurMode_t::A};
-    auto build_status = entry.graph->build(handle, modes);
+    auto build_status = entry.graph->build(ctx.handle, modes);
     if (build_status.is_bad()) {
         throw std::runtime_error(std::string("graph build failed: ") + build_status.get_message());
     }
@@ -204,6 +228,7 @@ CacheEntry build_cache_entry(cudnnHandle_t handle, const CacheKey& key, float at
         if (cerr != cudaSuccess) {
             throw std::runtime_error(std::string("cudaMalloc workspace failed: ") + cudaGetErrorString(cerr));
         }
+        entry.workspace_bytes = workspace_size;
     }
 
     return entry;
@@ -262,7 +287,7 @@ extern "C" int cudnn_thd_sdpa_fwd(
             it->second.lru_it = ctx.lru.begin();
         } else {
             try {
-                auto entry = build_cache_entry(ctx.handle, key, attn_scale);
+                auto entry = build_cache_entry(ctx, key, attn_scale);
                 ctx.lru.push_front(key);
                 CacheValue v{std::move(entry), ctx.lru.begin()};
                 it = ctx.cache.emplace(key, std::move(v)).first;
@@ -321,4 +346,31 @@ extern "C" int cudnn_thd_sdpa_fwd(
 
 extern "C" const char* cudnn_thd_last_error(void) {
     return g_last_error.c_str();
+}
+
+extern "C" int64_t cudnn_thd_cache_plan_count(void) {
+    return static_cast<int64_t>(g_ctx.cache.size());
+}
+
+extern "C" int64_t cudnn_thd_cache_workspace_bytes(void) {
+    int64_t total = 0;
+    for (const auto& kv : g_ctx.cache) {
+        total += kv.second.entry.workspace_bytes;
+    }
+    return total;
+}
+
+extern "C" int cudnn_thd_cuda_mem_info(int64_t* free_bytes, int64_t* total_bytes) {
+    if (!free_bytes || !total_bytes) {
+        return -1;
+    }
+    size_t free_b = 0;
+    size_t total_b = 0;
+    cudaError_t st = cudaMemGetInfo(&free_b, &total_b);
+    if (st != cudaSuccess) {
+        return -1;
+    }
+    *free_bytes = static_cast<int64_t>(free_b);
+    *total_bytes = static_cast<int64_t>(total_b);
+    return 0;
 }

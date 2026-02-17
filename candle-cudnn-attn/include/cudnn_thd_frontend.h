@@ -26,4 +26,8 @@ int cudnn_thd_sdpa_fwd(
 
 const char* cudnn_thd_last_error(void);
 
+int64_t cudnn_thd_cache_plan_count(void);
+int64_t cudnn_thd_cache_workspace_bytes(void);
+int cudnn_thd_cuda_mem_info(int64_t* free_bytes, int64_t* total_bytes);
+
 }

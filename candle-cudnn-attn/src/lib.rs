@@ -21,3 +21,15 @@ pub fn is_available() -> bool {
 pub fn version_info() -> Result<String> {
     attention::version_info()
 }
+
+pub fn debug_cache_plan_count() -> usize {
+    frontend::cache_plan_count()
+}
+
+pub fn debug_cache_workspace_bytes() -> usize {
+    frontend::cache_workspace_bytes()
+}
+
+pub fn debug_cuda_mem_info() -> std::result::Result<(usize, usize), String> {
+    frontend::cuda_mem_info()
+}
