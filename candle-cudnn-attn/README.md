@@ -19,6 +19,53 @@ This crate provides high-performance attention operations using NVIDIA's cuDNN f
 - cuDNN 9.0 or newer
 - GPU with SM80 (Ampere) architecture or newer
 
+## Installing cuDNN
+
+### Option 1: Using pip (Recommended for Python environments)
+
+```bash
+pip install nvidia-cudnn-cu12
+```
+
+This will install cuDNN 9.x for CUDA 12.x in your Python environment.
+
+### Option 2: Using NVIDIA's apt repository (System-wide installation)
+
+```bash
+# Add NVIDIA package repositories
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb
+sudo dpkg -i cuda-keyring_1.0-1_all.deb
+sudo apt-get update
+
+# Install cuDNN
+sudo apt-get install libcudnn9-cuda-12
+sudo apt-get install libcudnn9-dev-cuda-12  # For development headers
+```
+
+### Option 3: Manual download from NVIDIA
+
+1. Go to https://developer.nvidia.com/cudnn-downloads
+2. Download the cuDNN 9.x for CUDA 12.x tarball
+3. Extract and copy files to CUDA installation:
+
+```bash
+tar -xvf cudnn-linux-x86_64-9.x.x.x_cuda12-archive.tar.xz
+sudo cp cudnn-linux-x86_64-9.x.x.x_cuda12-archive/include/cudnn*.h /usr/local/cuda/include/
+sudo cp cudnn-linux-x86_64-9.x.x.x_cuda12-archive/lib/libcudnn* /usr/local/cuda/lib64/
+sudo chmod a+r /usr/local/cuda/include/cudnn*.h /usr/local/cuda/lib64/libcudnn*
+```
+
+### Verifying Installation
+
+```bash
+# Check cuDNN version
+python -c "import nvidia.cudnn; print(nvidia.cudnn.__version__)" 2>/dev/null || echo "Not installed via pip"
+
+# Or check system installation
+ls -la /usr/local/cuda/lib64/libcudnn* 2>/dev/null || echo "Not in CUDA directory"
+ls -la /usr/lib/x86_64-linux-gnu/libcudnn* 2>/dev/null || echo "Not in system lib"
+```
+
 ## Usage
 
 ```rust

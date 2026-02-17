@@ -62,23 +62,30 @@ pub fn flash_attn_varlen(
     // cu_seqlens has shape (batch_size + 1,) with cumulative lengths
     // ragged_offset needs shape (batch_size + 1, 1, 1, 1)
     let batch_size = seqlens_q.dim(0)? - 1;
-    let ragged_offset = seqlens_q
+
+    // Create separate ragged offsets for Q and K/V
+    // This supports encoder-decoder attention where Q and K/V have different lengths
+    let ragged_offset_q = seqlens_q
         .reshape((batch_size + 1, 1, 1, 1))?
         .to_dtype(DType::U32)?;
 
-    // Validate ragged_offset with the correct batch size before conversion
-    validate_ragged_offset(&ragged_offset, batch_size)?;
+    let ragged_offset_k = seqlens_k
+        .reshape((batch_size + 1, 1, 1, 1))?
+        .to_dtype(DType::U32)?;
 
-    // Use max of max_seqlen_q and max_seqlen_k for the implementation
-    let max_seqlen = max_seqlen_q.max(max_seqlen_k);
+    // Validate ragged offsets with the correct batch size
+    validate_ragged_offset(&ragged_offset_q, batch_size)?;
+    validate_ragged_offset(&ragged_offset_k, batch_size)?;
 
-    // Call the internal attention implementation
+    // Call the internal attention implementation with separate Q and K/V ragged offsets
     let output_4d = attention_varlen_impl(
         &q_4d,
         &k_4d,
         &v_4d,
-        &ragged_offset,
-        max_seqlen,
+        &ragged_offset_q,
+        &ragged_offset_k,
+        max_seqlen_q,
+        max_seqlen_k,
         softmax_scale,
         causal,
     )?;
@@ -91,12 +98,15 @@ pub fn flash_attn_varlen(
 }
 
 /// Internal implementation for variable length attention with 4D tensors
+/// Supports different sequence lengths for Q and K/V (encoder-decoder attention)
 fn attention_varlen_impl(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
-    ragged_offset: &Tensor,
-    _max_seqlen: usize,
+    ragged_offset_q: &Tensor,
+    ragged_offset_k: &Tensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
     softmax_scale: f32,
     causal: bool,
 ) -> Result<Tensor> {
@@ -112,8 +122,22 @@ fn attention_varlen_impl(
         ));
     }
 
-    // Use cuDNN implementation - no fallback to reference
-    cudnn_attention_impl(q, k, v, ragged_offset, softmax_scale, causal)
+    // Validate both ragged offsets
+    let batch_size = ragged_offset_q.dim(0)? - 1;
+    validate_ragged_offset(ragged_offset_q, batch_size)?;
+    validate_ragged_offset(ragged_offset_k, batch_size)?;
+
+    cudnn_attention_impl(
+        q,
+        k,
+        v,
+        ragged_offset_q,
+        ragged_offset_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        causal,
+    )
 }
 
 /// Validate flash-attention compatible inputs (3D tensors)
@@ -176,10 +200,12 @@ fn validate_flash_attn_inputs(
         ));
     }
 
-    // Check seqlens have the same length
+    // Check seqlens have the same length (same batch size)
+    // Note: seqlens_q and seqlens_k can have different sequence lengths per batch element
+    // (e.g., in encoder-decoder attention), but must have the same number of sequences
     if seqlens_q.dim(0)? != seqlens_k.dim(0)? {
         return Err(CuDNNError::invalid_configuration(
-            "seqlens_q and seqlens_k must have the same length",
+            "seqlens_q and seqlens_k must have the same batch size (length)",
         ));
     }
 
@@ -319,11 +345,15 @@ pub fn version_info() -> Result<String> {
 }
 
 /// Actual cuDNN attention implementation (4D tensors)
+/// Supports different sequence lengths for Q and K/V (encoder-decoder attention)
 fn cudnn_attention_impl(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
-    ragged_offset: &Tensor,
+    ragged_offset_q: &Tensor,
+    ragged_offset_k: &Tensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
     softmax_scale: f32,
     causal: bool,
 ) -> Result<Tensor> {

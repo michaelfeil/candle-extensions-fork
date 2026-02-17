@@ -54,14 +54,33 @@ impl CuDNNGraph {
         })
     }
 
+    /// Build SDPA operation graph for variable length attention
+    pub fn build_sdpa_varlen(
+        &mut self,
+        q: &CuDNNTensor,
+        k: &CuDNNTensor,
+        v: &CuDNNTensor,
+        ragged_offset_q: &CuDNNTensor,
+        ragged_offset_k: &CuDNNTensor,
+        softmax_scale: f32,
+        causal: bool,
+    ) -> Result<CuDNNTensor> {
+        // For now, return an error indicating this needs implementation
+        // In a full implementation, this would:
+        // 1. Create SDPA operation descriptor
+        // 2. Set Q, K, V tensors
+        // 3. Set ragged offsets for variable lengths
+        // 4. Set softmax scale and causal masking
+        // 5. Build the operation graph
+        // 6. Compile execution plan
+        Err(CuDNNError::not_available(
+            "SDPA varlen graph building not yet implemented - requires cuDNN 9.x frontend API integration"
+        ))
+    }
+
     /// Build the graph and create an execution plan
     pub fn build(&mut self) -> Result<()> {
         // For now, return an error indicating this needs implementation
-        // In a full implementation, this would:
-        // 1. Finalize the graph
-        // 2. Query for execution plans
-        // 3. Select the best execution plan
-        // 4. Allocate workspace
         Err(CuDNNError::not_available(
             "Graph building not yet fully implemented",
         ))
@@ -76,24 +95,6 @@ impl CuDNNGraph {
         // For now, return an error indicating this needs implementation
         Err(CuDNNError::not_available(
             "Graph execution not yet fully implemented",
-        ))
-    }
-
-    /// Add SDPA (Scaled Dot Product Attention) operation to the graph
-    pub fn sdpa_forward(
-        &mut self,
-        _q: &CuDNNTensor,
-        _k: &CuDNNTensor,
-        _v: &CuDNNTensor,
-        _attn_scale: f32,
-        _causal: bool,
-        _use_padding_mask: bool,
-    ) -> Result<(CuDNNTensor, Option<CuDNNTensor>)> {
-        // For now, return an error indicating this needs implementation
-        // In a full implementation, this would create the SDPA operation
-        // using the cuDNN backend API
-        Err(CuDNNError::not_available(
-            "SDPA operation not yet fully implemented",
         ))
     }
 }

@@ -18,17 +18,26 @@ fn main() {
     let cudnn_lib = cudnn_lib.unwrap();
 
     println!("cargo:rustc-link-search=native={}", cudnn_lib.display());
+    // Link all cuDNN libraries for SDPA support
     println!("cargo:rustc-link-lib=dylib=cudnn");
     println!("cargo:rustc-link-lib=dylib=cudnn_ops");
     println!("cargo:rustc-link-lib=dylib=cudnn_adv");
+    println!("cargo:rustc-link-lib=dylib=cudnn_graph");
+    println!("cargo:rustc-link-lib=dylib=cudnn_cnn");
+    println!("cargo:rustc-link-lib=dylib=cudnn_heuristic");
+    println!("cargo:rustc-link-lib=dylib=cudnn_engines_precompiled");
+    println!("cargo:rustc-link-lib=dylib=cudnn_engines_runtime_compiled");
 
     // Find CUDA include path
     let cuda_include = find_cuda_include();
 
     // Generate bindings using bindgen
+    // Include all cuDNN headers for SDPA support
     let mut builder = bindgen::Builder::default()
         .header(cudnn_include.join("cudnn.h").to_str().unwrap())
         .header(cudnn_include.join("cudnn_ops.h").to_str().unwrap())
+        .header(cudnn_include.join("cudnn_adv.h").to_str().unwrap())
+        .header(cudnn_include.join("cudnn_graph.h").to_str().unwrap())
         .clang_arg(format!("-I{}", cudnn_include.display()))
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .allowlist_function("cudnn.*")
@@ -82,7 +91,14 @@ fn find_cudnn_include() -> Option<PathBuf> {
         return Some(PathBuf::from(path));
     }
 
-    // Common paths
+    // APT-installed cuDNN 9.x (libcudnn9-dev-cuda-12)
+    // This is the primary location for apt-installed cuDNN
+    let apt_path = PathBuf::from("/usr/include/x86_64-linux-gnu");
+    if apt_path.join("cudnn.h").exists() {
+        return Some(apt_path);
+    }
+
+    // Fallback: Common paths
     let paths = [
         "/usr/local/cuda/include",
         "/usr/include",
@@ -96,13 +112,6 @@ fn find_cudnn_include() -> Option<PathBuf> {
         }
     }
 
-    // Check Python package location
-    let nvidia_path = PathBuf::from("/usr/local/lib/python3.12/dist-packages/nvidia");
-    let cudnn_include = nvidia_path.join("cudnn").join("include");
-    if cudnn_include.join("cudnn.h").exists() {
-        return Some(cudnn_include);
-    }
-
     None
 }
 
@@ -112,7 +121,14 @@ fn find_cudnn_lib() -> Option<PathBuf> {
         return Some(PathBuf::from(path));
     }
 
-    // Common paths
+    // APT-installed cuDNN 9.x (libcudnn9-cuda-12)
+    // This is the primary location for apt-installed cuDNN
+    let apt_path = PathBuf::from("/usr/lib/x86_64-linux-gnu");
+    if apt_path.join("libcudnn.so.9").exists() || apt_path.join("libcudnn.so").exists() {
+        return Some(apt_path);
+    }
+
+    // Fallback: Common paths
     let paths = [
         "/usr/local/cuda/lib64",
         "/usr/local/cuda/lib",
@@ -127,13 +143,6 @@ fn find_cudnn_lib() -> Option<PathBuf> {
         if lib_path.join("libcudnn.so").exists() || lib_path.join("libcudnn.so.9").exists() {
             return Some(lib_path);
         }
-    }
-
-    // Check Python package location
-    let nvidia_path = PathBuf::from("/usr/local/lib/python3.12/dist-packages/nvidia");
-    let cudnn_lib = nvidia_path.join("cudnn").join("lib");
-    if cudnn_lib.join("libcudnn.so").exists() || cudnn_lib.join("libcudnn.so.9").exists() {
-        return Some(cudnn_lib);
     }
 
     None

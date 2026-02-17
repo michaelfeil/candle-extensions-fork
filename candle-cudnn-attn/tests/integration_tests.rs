@@ -272,8 +272,9 @@ fn test_flash_attn_varlen_with_dtype(
     // For now, just verify the reference implementation works
     // When cuDNN is implemented, compare against it
     println!("  Reference output shape: {:?}", reference_output.shape());
-    println!("  ✅ Reference implementation works for {:?}", dtype);
-
+    let diff_val = reference_output.abs()?.mean_all()?.to_scalar::<f32>()?;
+    println!("  ✅ Reference implementation works for {:?}", dtype);println!("  Mean absolute difference: {:.6e}", diff_val);    println!("  Mean absolute difference: {:.6e}", diff_val);
+    
     println!("  Mean absolute difference: {:.6e}", diff_val);
     println!("  Tolerance: {:.6e}", tolerance);
 
@@ -287,7 +288,6 @@ fn test_flash_attn_varlen_with_dtype(
     );
 
     println!("  ✅ {:?} test passed!", dtype);
-
     Ok(())
 }
 
