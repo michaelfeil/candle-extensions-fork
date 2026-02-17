@@ -59,9 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for causal in [false, true] {
         println!("\n🚀 Running cuDNN attention (causal={})...", causal);
-        let start = std::time::Instant::now();
-
-        let output = flash_attn_varlen(
+        let mut output = flash_attn_varlen(
             &q,
             &k,
             &v,
@@ -70,9 +68,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             1.0 / (head_dim as f32).sqrt(),
             causal,
         )?;
+        // Force completion of the warmup launch.
+        let _ = output.sum_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
 
+        let iters = 20;
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            output = flash_attn_varlen(
+                &q,
+                &k,
+                &v,
+                &seqlens_q,
+                seq_len,
+                1.0 / (head_dim as f32).sqrt(),
+                causal,
+            )?;
+        }
+        let _ = output.sum_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
         let duration = start.elapsed();
-        println!("✅ Attention completed in {:?}", duration);
+        println!(
+            "✅ Steady-state avg over {} iters: {:?}",
+            iters,
+            duration / iters as u32
+        );
 
         println!("\n📋 Output Verification:");
         println!("  Input shape: {:?}", q.shape());

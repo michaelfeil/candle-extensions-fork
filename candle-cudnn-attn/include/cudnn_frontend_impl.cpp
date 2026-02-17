@@ -4,6 +4,9 @@
 #include <cudnn.h>
 #include <cudnn_frontend.h>
 
+#include <cstdint>
+#include <cstring>
+#include <list>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -22,14 +25,189 @@ int fail(const std::string& msg) {
     return -1;
 }
 
-struct HandleGuard {
+struct CacheKey {
+    int64_t b;
+    int64_t h;
+    int64_t s;
+    int64_t d;
+    int causal;
+    int is_bf16;
+    uint32_t scale_bits;
+
+    bool operator==(const CacheKey& other) const {
+        return b == other.b && h == other.h && s == other.s && d == other.d && causal == other.causal &&
+               is_bf16 == other.is_bf16 && scale_bits == other.scale_bits;
+    }
+};
+
+struct CacheKeyHash {
+    std::size_t operator()(const CacheKey& k) const {
+        std::size_t seed = 0;
+        auto mix = [&seed](std::size_t v) {
+            seed ^= v + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        };
+        mix(std::hash<int64_t>{}(k.b));
+        mix(std::hash<int64_t>{}(k.h));
+        mix(std::hash<int64_t>{}(k.s));
+        mix(std::hash<int64_t>{}(k.d));
+        mix(std::hash<int>{}(k.causal));
+        mix(std::hash<int>{}(k.is_bf16));
+        mix(std::hash<uint32_t>{}(k.scale_bits));
+        return seed;
+    }
+};
+
+struct CacheEntry {
+    std::shared_ptr<cudnn_frontend::graph::Graph> graph;
+    void* workspace = nullptr;
+};
+
+struct CacheValue {
+    CacheEntry entry;
+    std::list<CacheKey>::iterator lru_it;
+};
+
+struct ThreadContext {
+    static constexpr std::size_t kMaxPlans = 2048;
+
     cudnnHandle_t handle = nullptr;
-    ~HandleGuard() {
+    std::unordered_map<CacheKey, CacheValue, CacheKeyHash> cache;
+    std::list<CacheKey> lru;
+
+    ~ThreadContext() {
+        for (auto& kv : cache) {
+            if (kv.second.entry.workspace) {
+                cudaFree(kv.second.entry.workspace);
+            }
+        }
         if (handle) {
             cudnnDestroy(handle);
         }
     }
 };
+
+thread_local ThreadContext g_ctx;
+
+CacheEntry build_cache_entry(cudnnHandle_t handle, const CacheKey& key, float attn_scale) {
+    namespace fe = cudnn_frontend;
+    CacheEntry entry;
+    entry.graph = std::make_shared<fe::graph::Graph>();
+    entry.graph->set_io_data_type(key.is_bf16 ? fe::DataType_t::BFLOAT16 : fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    constexpr int64_t Q_UID = 1;
+    constexpr int64_t K_UID = 2;
+    constexpr int64_t V_UID = 3;
+    constexpr int64_t O_UID = 4;
+    constexpr int64_t SEQ_Q_UID = 5;
+    constexpr int64_t SEQ_KV_UID = 6;
+    constexpr int64_t Q_RAGGED_UID = 7;
+    constexpr int64_t K_RAGGED_UID = 8;
+    constexpr int64_t V_RAGGED_UID = 9;
+    constexpr int64_t O_RAGGED_UID = 10;
+
+    auto q_rag = entry.graph->tensor(fe::graph::Tensor_attributes()
+                                         .set_name("q_ragged")
+                                         .set_uid(Q_RAGGED_UID)
+                                         .set_data_type(fe::DataType_t::INT64)
+                                         .set_dim({key.b + 1, 1, 1, 1})
+                                         .set_stride({1, 1, 1, 1}));
+    auto k_rag = entry.graph->tensor(fe::graph::Tensor_attributes()
+                                         .set_name("k_ragged")
+                                         .set_uid(K_RAGGED_UID)
+                                         .set_data_type(fe::DataType_t::INT64)
+                                         .set_dim({key.b + 1, 1, 1, 1})
+                                         .set_stride({1, 1, 1, 1}));
+    auto v_rag = entry.graph->tensor(fe::graph::Tensor_attributes()
+                                         .set_name("v_ragged")
+                                         .set_uid(V_RAGGED_UID)
+                                         .set_data_type(fe::DataType_t::INT64)
+                                         .set_dim({key.b + 1, 1, 1, 1})
+                                         .set_stride({1, 1, 1, 1}));
+    auto o_rag = entry.graph->tensor(fe::graph::Tensor_attributes()
+                                         .set_name("o_ragged")
+                                         .set_uid(O_RAGGED_UID)
+                                         .set_data_type(fe::DataType_t::INT64)
+                                         .set_dim({key.b + 1, 1, 1, 1})
+                                         .set_stride({1, 1, 1, 1}));
+
+    std::vector<int64_t> bhsd_dim = {key.b, key.h, key.s, key.d};
+    std::vector<int64_t> bhsd_stride = {key.h * key.s * key.d, key.d, key.h * key.d, 1};
+
+    auto Q = entry.graph->tensor(fe::graph::Tensor_attributes()
+                                     .set_name("Q")
+                                     .set_uid(Q_UID)
+                                     .set_dim(bhsd_dim)
+                                     .set_stride(bhsd_stride)
+                                     .set_ragged_offset(q_rag));
+    auto K = entry.graph->tensor(fe::graph::Tensor_attributes()
+                                     .set_name("K")
+                                     .set_uid(K_UID)
+                                     .set_dim(bhsd_dim)
+                                     .set_stride(bhsd_stride)
+                                     .set_ragged_offset(k_rag));
+    auto V = entry.graph->tensor(fe::graph::Tensor_attributes()
+                                     .set_name("V")
+                                     .set_uid(V_UID)
+                                     .set_dim(bhsd_dim)
+                                     .set_stride(bhsd_stride)
+                                     .set_ragged_offset(v_rag));
+
+    auto seqQ = entry.graph->tensor(fe::graph::Tensor_attributes()
+                                        .set_name("seq_q")
+                                        .set_uid(SEQ_Q_UID)
+                                        .set_data_type(fe::DataType_t::INT32)
+                                        .set_dim({key.b, 1, 1, 1})
+                                        .set_stride({1, 1, 1, 1}));
+    auto seqKV = entry.graph->tensor(fe::graph::Tensor_attributes()
+                                         .set_name("seq_kv")
+                                         .set_uid(SEQ_KV_UID)
+                                         .set_data_type(fe::DataType_t::INT32)
+                                         .set_dim({key.b, 1, 1, 1})
+                                         .set_stride({1, 1, 1, 1}));
+
+    auto sdpa_options = fe::graph::SDPA_attributes()
+                            .set_name("thd_sdpa")
+                            .set_generate_stats(false)
+                            .set_attn_scale(attn_scale)
+                            .set_padding_mask(true)
+                            .set_seq_len_q(seqQ)
+                            .set_seq_len_kv(seqKV);
+    if (key.causal) {
+        sdpa_options.set_causal_mask(true);
+    }
+
+    auto out = entry.graph->sdpa(Q, K, V, sdpa_options);
+    auto O = out[0];
+    O->set_output(true)
+        .set_uid(O_UID)
+        .set_dim(bhsd_dim)
+        .set_stride(bhsd_stride)
+        .set_ragged_offset(o_rag);
+
+    // Favor heuristics-A engines for steady-state speed.
+    std::vector<fe::HeurMode_t> modes = {fe::HeurMode_t::A};
+    auto build_status = entry.graph->build(handle, modes);
+    if (build_status.is_bad()) {
+        throw std::runtime_error(std::string("graph build failed: ") + build_status.get_message());
+    }
+
+    int64_t workspace_size = 0;
+    auto ws_status = entry.graph->get_workspace_size(workspace_size);
+    if (ws_status.is_bad()) {
+        throw std::runtime_error(std::string("get_workspace_size failed: ") + ws_status.get_message());
+    }
+
+    if (workspace_size > 0) {
+        cudaError_t cerr = cudaMalloc(&entry.workspace, static_cast<size_t>(workspace_size));
+        if (cerr != cudaSuccess) {
+            throw std::runtime_error(std::string("cudaMalloc workspace failed: ") + cudaGetErrorString(cerr));
+        }
+    }
+
+    return entry;
+}
 }  // namespace
 
 extern "C" int cudnn_thd_sdpa_fwd(
@@ -59,23 +237,51 @@ extern "C" int cudnn_thd_sdpa_fwd(
             return fail("invalid dimensions in cudnn_thd_sdpa_fwd");
         }
 
-        HandleGuard guard;
-        cudnnStatus_t st = cudnnCreate(&guard.handle);
-        if (st != CUDNN_STATUS_SUCCESS) {
-            return fail(std::string("cudnnCreate failed: ") + cudnnGetErrorString(st));
+        ThreadContext& ctx = g_ctx;
+        cudnnStatus_t st = CUDNN_STATUS_SUCCESS;
+        if (ctx.handle == nullptr) {
+            st = cudnnCreate(&ctx.handle);
+            if (st != CUDNN_STATUS_SUCCESS) {
+                return fail(std::string("cudnnCreate failed: ") + cudnnGetErrorString(st));
+            }
         }
+
         if (stream) {
-            st = cudnnSetStream(guard.handle, reinterpret_cast<cudaStream_t>(stream));
+            st = cudnnSetStream(ctx.handle, reinterpret_cast<cudaStream_t>(stream));
             if (st != CUDNN_STATUS_SUCCESS) {
                 return fail(std::string("cudnnSetStream failed: ") + cudnnGetErrorString(st));
             }
         }
 
-        namespace fe = cudnn_frontend;
-        auto graph = std::make_shared<fe::graph::Graph>();
-        graph->set_io_data_type(is_bf16 ? fe::DataType_t::BFLOAT16 : fe::DataType_t::HALF)
-            .set_intermediate_data_type(fe::DataType_t::FLOAT)
-            .set_compute_data_type(fe::DataType_t::FLOAT);
+        uint32_t scale_bits = 0;
+        std::memcpy(&scale_bits, &attn_scale, sizeof(scale_bits));
+        CacheKey key{b, h, s, d, causal, is_bf16, scale_bits};
+        auto it = ctx.cache.find(key);
+        if (it != ctx.cache.end()) {
+            ctx.lru.splice(ctx.lru.begin(), ctx.lru, it->second.lru_it);
+            it->second.lru_it = ctx.lru.begin();
+        } else {
+            try {
+                auto entry = build_cache_entry(ctx.handle, key, attn_scale);
+                ctx.lru.push_front(key);
+                CacheValue v{std::move(entry), ctx.lru.begin()};
+                it = ctx.cache.emplace(key, std::move(v)).first;
+
+                if (ctx.cache.size() > ThreadContext::kMaxPlans) {
+                    CacheKey evict_key = ctx.lru.back();
+                    ctx.lru.pop_back();
+                    auto evict_it = ctx.cache.find(evict_key);
+                    if (evict_it != ctx.cache.end()) {
+                        if (evict_it->second.entry.workspace) {
+                            cudaFree(evict_it->second.entry.workspace);
+                        }
+                        ctx.cache.erase(evict_it);
+                    }
+                }
+            } catch (const std::exception& e) {
+                return fail(std::string("cache build exception: ") + e.what());
+            }
+        }
 
         constexpr int64_t Q_UID = 1;
         constexpr int64_t K_UID = 2;
@@ -87,106 +293,6 @@ extern "C" int cudnn_thd_sdpa_fwd(
         constexpr int64_t K_RAGGED_UID = 8;
         constexpr int64_t V_RAGGED_UID = 9;
         constexpr int64_t O_RAGGED_UID = 10;
-
-        auto q_rag = graph->tensor(fe::graph::Tensor_attributes()
-                                       .set_name("q_ragged")
-                                       .set_uid(Q_RAGGED_UID)
-                                       .set_data_type(fe::DataType_t::INT64)
-                                       .set_dim({b + 1, 1, 1, 1})
-                                       .set_stride({1, 1, 1, 1}));
-        auto k_rag = graph->tensor(fe::graph::Tensor_attributes()
-                                       .set_name("k_ragged")
-                                       .set_uid(K_RAGGED_UID)
-                                       .set_data_type(fe::DataType_t::INT64)
-                                       .set_dim({b + 1, 1, 1, 1})
-                                       .set_stride({1, 1, 1, 1}));
-        auto v_rag = graph->tensor(fe::graph::Tensor_attributes()
-                                       .set_name("v_ragged")
-                                       .set_uid(V_RAGGED_UID)
-                                       .set_data_type(fe::DataType_t::INT64)
-                                       .set_dim({b + 1, 1, 1, 1})
-                                       .set_stride({1, 1, 1, 1}));
-        auto o_rag = graph->tensor(fe::graph::Tensor_attributes()
-                                       .set_name("o_ragged")
-                                       .set_uid(O_RAGGED_UID)
-                                       .set_data_type(fe::DataType_t::INT64)
-                                       .set_dim({b + 1, 1, 1, 1})
-                                       .set_stride({1, 1, 1, 1}));
-
-        std::vector<int64_t> bhsd_dim = {b, h, s, d};
-        std::vector<int64_t> bhsd_stride = {h * s * d, d, h * d, 1};
-
-        auto Q = graph->tensor(fe::graph::Tensor_attributes()
-                                   .set_name("Q")
-                                   .set_uid(Q_UID)
-                                   .set_dim(bhsd_dim)
-                                   .set_stride(bhsd_stride)
-                                   .set_ragged_offset(q_rag));
-        auto K = graph->tensor(fe::graph::Tensor_attributes()
-                                   .set_name("K")
-                                   .set_uid(K_UID)
-                                   .set_dim(bhsd_dim)
-                                   .set_stride(bhsd_stride)
-                                   .set_ragged_offset(k_rag));
-        auto V = graph->tensor(fe::graph::Tensor_attributes()
-                                   .set_name("V")
-                                   .set_uid(V_UID)
-                                   .set_dim(bhsd_dim)
-                                   .set_stride(bhsd_stride)
-                                   .set_ragged_offset(v_rag));
-
-        auto seqQ = graph->tensor(fe::graph::Tensor_attributes()
-                                      .set_name("seq_q")
-                                      .set_uid(SEQ_Q_UID)
-                                      .set_data_type(fe::DataType_t::INT32)
-                                      .set_dim({b, 1, 1, 1})
-                                      .set_stride({1, 1, 1, 1}));
-        auto seqKV = graph->tensor(fe::graph::Tensor_attributes()
-                                       .set_name("seq_kv")
-                                       .set_uid(SEQ_KV_UID)
-                                       .set_data_type(fe::DataType_t::INT32)
-                                       .set_dim({b, 1, 1, 1})
-                                       .set_stride({1, 1, 1, 1}));
-
-        auto sdpa_options = fe::graph::SDPA_attributes()
-                                .set_name("thd_sdpa")
-                                .set_generate_stats(false)
-                                .set_attn_scale(attn_scale)
-                                .set_padding_mask(true)
-                                .set_seq_len_q(seqQ)
-                                .set_seq_len_kv(seqKV);
-        if (causal) {
-            sdpa_options.set_causal_mask(true);
-        }
-
-        auto out = graph->sdpa(Q, K, V, sdpa_options);
-        auto O = out[0];
-        O->set_output(true)
-            .set_uid(O_UID)
-            .set_dim(bhsd_dim)
-            .set_stride(bhsd_stride)
-            .set_ragged_offset(o_rag);
-
-        std::vector<fe::HeurMode_t> modes = {fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK};
-        auto build_status = graph->build(guard.handle, modes);
-        if (build_status.is_bad()) {
-            return fail(std::string("graph build failed: ") + build_status.get_message());
-        }
-
-        int64_t workspace_size = 0;
-        auto ws_status = graph->get_workspace_size(workspace_size);
-        if (ws_status.is_bad()) {
-            return fail(std::string("get_workspace_size failed: ") + ws_status.get_message());
-        }
-
-        void* workspace = nullptr;
-        if (workspace_size > 0) {
-            cudaError_t cerr = cudaMalloc(&workspace, static_cast<size_t>(workspace_size));
-            if (cerr != cudaSuccess) {
-                return fail(std::string("cudaMalloc workspace failed: ") + cudaGetErrorString(cerr));
-            }
-        }
-
         std::unordered_map<int64_t, void*> variant_pack = {
             {Q_UID, q},
             {K_UID, k},
@@ -200,10 +306,7 @@ extern "C" int cudnn_thd_sdpa_fwd(
             {O_RAGGED_UID, const_cast<int64_t*>(o_ragged)},
         };
 
-        auto exec_status = graph->execute(guard.handle, variant_pack, workspace);
-        if (workspace) {
-            cudaFree(workspace);
-        }
+        auto exec_status = it->second.entry.graph->execute(ctx.handle, variant_pack, it->second.entry.workspace);
         if (exec_status.is_bad()) {
             return fail(std::string("graph execute failed: ") + exec_status.get_message());
         }

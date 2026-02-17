@@ -143,8 +143,7 @@ impl CuDNNAttnTHD {
             stream: stream_ptr,
         };
 
-        crate::frontend::run_thd_sdpa_fwd(&params)
-        .map_err(candle::Error::msg)?;
+        crate::frontend::run_thd_sdpa_fwd(&params).map_err(candle::Error::msg)?;
 
         let dst = candle::CudaStorage::wrap_cuda_slice(dst, dev.clone());
         Ok((dst, out_shape))
