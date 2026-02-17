@@ -1,14 +1,15 @@
 [package]
 name = "candle-cudnn-attn"
 description = "cuDNN attention bindings for candle - flash-attention compatible API"
-homepage = "https://github.com/huggingface/candle-extensions/candle-cudnn-attn/"
+homepage = "https://github.com/michaelfeil/candle-extensions/candle-cudnn-attn/"
+authors = ["Michael Feil"]
 documentation = "https://docs.rs/candle-cudnn-attn"
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
 keywords.workspace = true
 categories.workspace = true
-license.workspace = true
+license = "MIT OR Apache-2.0"
 repository.workspace = true
 
 [dependencies]
