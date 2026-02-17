@@ -127,9 +127,11 @@ fn test_error_handling() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Reference attention implementation for THD tensors (flash-attention compatible)
-/// This processes each sequence independently and concatenates results
-fn reference_attention_thd(
+/// Scalar FP32 reference for THD varlen attention.
+///
+/// This intentionally loops over every sequence slice, head, query index and key index,
+/// mirroring the expected varlen behavior directly.
+fn reference_attention_thd_index_loop(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -137,106 +139,91 @@ fn reference_attention_thd(
     softmax_scale: f32,
     causal: bool,
 ) -> candle::Result<Tensor> {
-    // q, k, v shapes: (total_tokens, num_heads, head_dim)
-    let _num_heads = q.dim(1)?;
-    let _head_dim = q.dim(2)?;
-    let batch_size = cu_seqlens.len() - 1;
+    let dims = q.dims3()?;
+    let total_tokens = dims.0;
+    let num_heads = dims.1;
+    let head_dim = dims.2;
 
-    let mut outputs = Vec::new();
+    let qf = q.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let kf = k.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let vf = v.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let mut out = vec![0f32; total_tokens * num_heads * head_dim];
 
-    // Process each sequence independently
-    for i in 0..batch_size {
-        let start = cu_seqlens[i] as usize;
-        let end = cu_seqlens[i + 1] as usize;
+    let stride_t = num_heads * head_dim;
+    let stride_h = head_dim;
+
+    for b in 0..(cu_seqlens.len() - 1) {
+        let start = cu_seqlens[b] as usize;
+        let end = cu_seqlens[b + 1] as usize;
         let seq_len = end - start;
 
-        // Extract slices for this sequence
-        // slice shape: (seq_len, num_heads, head_dim)
-        let q_slice = q.narrow(0, start, seq_len)?;
-        let k_slice = k.narrow(0, start, seq_len)?;
-        let v_slice = v.narrow(0, start, seq_len)?;
+        for h in 0..num_heads {
+            for i in 0..seq_len {
+                let qi = start + i;
 
-        // Convert to 4D by adding batch dimension: (1, seq_len, num_heads, head_dim)
-        let q_4d = q_slice.unsqueeze(0)?.transpose(1, 2)?; // (1, num_heads, seq_len, head_dim)
-        let k_4d = k_slice.unsqueeze(0)?.transpose(1, 2)?;
-        let v_4d = v_slice.unsqueeze(0)?.transpose(1, 2)?;
+                let mut scores = vec![f32::NEG_INFINITY; seq_len];
+                for (j, score) in scores.iter_mut().enumerate() {
+                    if causal && j > i {
+                        continue;
+                    }
+                    let kj = start + j;
+                    let mut dot = 0f32;
+                    let q_base = qi * stride_t + h * stride_h;
+                    let k_base = kj * stride_t + h * stride_h;
+                    for d in 0..head_dim {
+                        dot += qf[q_base + d] * kf[k_base + d];
+                    }
+                    *score = dot * softmax_scale;
+                }
 
-        // Compute attention using 4D reference
-        let out_4d = reference_attention_4d(&q_4d, &k_4d, &v_4d, softmax_scale, causal)?;
+                let mut max_score = f32::NEG_INFINITY;
+                for &s in &scores {
+                    if s > max_score {
+                        max_score = s;
+                    }
+                }
 
-        // Convert back to THD: (1, num_heads, seq_len, head_dim) -> (seq_len, num_heads, head_dim)
-        let out_thd = out_4d.transpose(1, 2)?.squeeze(0)?;
+                let mut sum_exp = 0f32;
+                let mut probs = vec![0f32; seq_len];
+                for j in 0..seq_len {
+                    let p = (scores[j] - max_score).exp();
+                    probs[j] = p;
+                    sum_exp += p;
+                }
 
-        outputs.push(out_thd);
-    }
-
-    // Concatenate all sequence outputs along the token dimension (dim 0)
-    Tensor::cat(&outputs, 0)
-}
-
-/// Reference attention implementation for 4D tensors (internal use)
-/// Input shapes: (batch, num_heads, seq_len, head_dim)
-fn reference_attention_4d(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    softmax_scale: f32,
-    causal: bool,
-) -> candle::Result<Tensor> {
-    // Q, K, V shapes: (batch, num_heads, seq_len, head_dim)
-    // Compute attention scores: Q @ K^T
-    let k_t = k.transpose(2, 3)?.contiguous()?; // (batch, num_heads, head_dim, seq_len)
-    let q_contig = q.contiguous()?;
-    let scores = q_contig.matmul(&k_t)?; // (batch, num_heads, seq_len, seq_len)
-
-    // Scale scores by softmax_scale - convert to same dtype as input
-    let scale_tensor = Tensor::new(softmax_scale, q.device())?.to_dtype(q.dtype())?;
-    let scaled_scores = scores.broadcast_mul(&scale_tensor)?;
-
-    // Apply causal mask if needed
-    let masked_scores = if causal {
-        // Create causal mask: upper triangular (including diagonal) is allowed
-        let seq_len = scores.dim(2)?;
-        let mut mask = vec![f32::NEG_INFINITY; seq_len * seq_len];
-        for i in 0..seq_len {
-            for j in 0..=i {
-                mask[i * seq_len + j] = 0.0;
+                let out_base = qi * stride_t + h * stride_h;
+                for d in 0..head_dim {
+                    let mut acc = 0f32;
+                    for j in 0..seq_len {
+                        let kj = start + j;
+                        let v_base = kj * stride_t + h * stride_h;
+                        acc += (probs[j] / sum_exp) * vf[v_base + d];
+                    }
+                    out[out_base + d] = acc;
+                }
             }
         }
-        let mask_tensor =
-            Tensor::from_vec(mask, (seq_len, seq_len), q.device())?.to_dtype(q.dtype())?;
-        let mask_tensor = mask_tensor.unsqueeze(0)?.unsqueeze(0)?; // (1, 1, seq_len, seq_len)
-        scaled_scores.broadcast_add(&mask_tensor)?
-    } else {
-        scaled_scores
-    };
+    }
 
-    // Softmax: exp(x) / sum(exp(x))
-    let max_val = masked_scores.max_keepdim(3)?;
-    let shifted = masked_scores.broadcast_sub(&max_val)?;
-    let exp_shifted = shifted.exp()?;
-    let sum_exp = exp_shifted.sum_keepdim(3)?;
-    let attn_weights = exp_shifted.broadcast_div(&sum_exp)?;
-
-    // Apply attention weights to values
-    let v_contig = v.contiguous()?;
-    let output = attn_weights.matmul(&v_contig)?; // (batch, num_heads, seq_len, head_dim)
-
-    Ok(output)
+    Tensor::from_vec(out, (total_tokens, num_heads, head_dim), q.device())
 }
 
 /// Test flash_attn_varlen against reference implementation for THD layout
 #[test]
 fn test_flash_attn_varlen_thd() -> Result<(), Box<dyn std::error::Error>> {
+    if !is_available() {
+        eprintln!("Skipping test_flash_attn_varlen_thd because cuDNN is unavailable");
+        return Ok(());
+    }
+
     let device = Device::new_cuda(0)?;
 
-    // Test with F32
-    println!("Testing THD layout with F32...");
-    test_flash_attn_varlen_thd_with_dtype(DType::F32, 1e-3, &device)?;
-
     // Test with F16
-    println!("\nTesting THD layout with F16...");
-    test_flash_attn_varlen_thd_with_dtype(DType::F16, 1e-2, &device)?;
+    println!("\nTesting THD layout with F16 (causal=false)...");
+    test_flash_attn_varlen_thd_with_dtype(DType::F16, 2e-4, false, &device)?;
+
+    println!("\nTesting THD layout with F16 (causal=true)...");
+    test_flash_attn_varlen_thd_with_dtype(DType::F16, 2e-4, true, &device)?;
 
     Ok(())
 }
@@ -245,14 +232,15 @@ fn test_flash_attn_varlen_thd() -> Result<(), Box<dyn std::error::Error>> {
 fn test_flash_attn_varlen_thd_with_dtype(
     dtype: DType,
     tolerance: f32,
+    causal: bool,
     device: &Device,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Create test tensors in THD format: (total_tokens, num_heads, head_dim)
     let num_heads = 4;
     let head_dim = 64;
 
-    // Variable sequence lengths: 32, 64, 48
-    let seq_lengths = [32, 64, 48];
+    // Variable sequence lengths
+    let seq_lengths = [31, 17, 23, 9];
     let batch_size = seq_lengths.len();
     let total_tokens: usize = seq_lengths.iter().sum();
 
@@ -271,7 +259,7 @@ fn test_flash_attn_varlen_thd_with_dtype(
         .to_dtype(dtype)?;
 
     // Create cumulative sequence lengths
-    // For seq_lengths [32, 64, 48], cu_seqlens = [0, 32, 96, 144]
+    // For seq_lengths [31, 17, 23, 9], cu_seqlens = [0, 31, 48, 71, 80]
     let mut cu_seqlens = vec![0u32];
     for &seq_len in &seq_lengths {
         cu_seqlens.push(cu_seqlens.last().unwrap() + seq_len as u32);
@@ -284,41 +272,32 @@ fn test_flash_attn_varlen_thd_with_dtype(
 
     // Compute reference output using THD reference implementation
     println!("Computing reference output...");
-    let _reference_output = reference_attention_thd(&q, &k, &v, &cu_seqlens, softmax_scale, true)?;
+    let reference_output =
+        reference_attention_thd_index_loop(&q, &k, &v, &cu_seqlens, softmax_scale, causal)?;
     println!("  Reference output computed successfully");
 
-    // Run cuDNN flash_attn_varlen - this will fail if cuDNN is not available
+    // Run cuDNN flash_attn_varlen
     println!("Running flash_attn_varlen...");
-    let result = flash_attn_varlen(&q, &k, &v, &seqlens, max_seqlen, softmax_scale, true);
+    let cudnn_output = flash_attn_varlen(&q, &k, &v, &seqlens, max_seqlen, softmax_scale, causal)?;
 
-    // For now, we expect this to fail since cuDNN is not available in this environment
-    // When cuDNN is available, this test should be updated to compare outputs
-    match result {
-        Ok(cudnn_output) => {
-            // cuDNN is available - compare with reference
-            println!("  cuDNN output computed successfully, comparing with reference...");
-            let diff = (&cudnn_output - &_reference_output)?.abs()?.mean_all()?;
-            let diff_val: f32 = diff.to_scalar()?;
+    println!("  cuDNN output computed successfully, comparing with reference...");
+    let diff = (&cudnn_output.to_dtype(DType::F32)? - &reference_output)?
+        .abs()?
+        .mean_all()?;
+    let diff_val: f32 = diff.to_scalar()?;
 
-            println!("Mean absolute difference: {:.6e}", diff_val);
-            println!("Tolerance: {:.6e}", tolerance);
+    println!("Mean absolute difference: {:.6e}", diff_val);
+    println!("Tolerance: {:.6e}", tolerance);
 
-            assert!(
-                diff_val < tolerance,
-                "cuDNN and reference outputs differ too much for {:?}: {:.6e} (tolerance: {:.6e})",
-                dtype,
-                diff_val,
-                tolerance
-            );
-        }
-        Err(e) => {
-            // cuDNN is not available - this is expected in this environment
-            println!("  cuDNN not available (expected): {}", e);
-            println!("  Skipping comparison test - reference implementation works correctly");
-        }
-    }
+    assert!(
+        diff_val < tolerance,
+        "cuDNN and reference outputs differ too much for {:?} causal={}: {:.6e} (tolerance: {:.6e})",
+        dtype,
+        causal,
+        diff_val,
+        tolerance
+    );
 
-    println!("  ✅ {:?} test passed!", dtype);
+    println!("  ✅ {:?} causal={} test passed!", dtype, causal);
     Ok(())
 }
-

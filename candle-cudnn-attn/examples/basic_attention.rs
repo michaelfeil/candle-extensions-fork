@@ -24,10 +24,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("📱 Using CUDA device: {:?}", device);
 
     // Create test tensors in 3D format (flash-attention compatible)
-    let num_heads = 2;
+    let num_heads = 8;
     let batch_size = 4;
-    let seq_len = 32;
-    let head_dim = 32;
+    let seq_len = 128;
+    let head_dim = 64;
     let total_tokens = batch_size * seq_len;
 
     println!("\n📊 Tensor Configuration:");
@@ -57,36 +57,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let seqlens_q = Tensor::new(&seqlens[..], &device)?;
     println!("✅ Created cumulative sequence lengths (cu_seqlens)");
 
-    // Run attention
-    println!("\n🚀 Running cuDNN attention...");
-    let start = std::time::Instant::now();
+    for causal in [false, true] {
+        println!("\n🚀 Running cuDNN attention (causal={})...", causal);
+        let start = std::time::Instant::now();
 
-    let output = flash_attn_varlen(
-        &q,
-        &k,
-        &v,
-        &seqlens_q,
-        seq_len, // max_seqlen
-        1.0 / (head_dim as f32).sqrt(),
-        false, // causal
-    )?;
+        let output = flash_attn_varlen(
+            &q,
+            &k,
+            &v,
+            &seqlens_q,
+            seq_len, // max_seqlen
+            1.0 / (head_dim as f32).sqrt(),
+            causal,
+        )?;
 
-    let duration = start.elapsed();
-    println!("✅ Attention completed in {:?}", duration);
+        let duration = start.elapsed();
+        println!("✅ Attention completed in {:?}", duration);
 
-    // Verify output
-    println!("\n📋 Output Verification:");
-    println!("  Input shape: {:?}", q.shape());
-    println!("  Output shape: {:?}", output.shape());
+        println!("\n📋 Output Verification:");
+        println!("  Input shape: {:?}", q.shape());
+        println!("  Output shape: {:?}", output.shape());
 
-    // Check some basic statistics
-    let output_mean = output.mean_all()?;
-    let output_min = output.min_all()?;
-    let output_max = output.max_all()?;
+        let output_f32 = output.to_dtype(DType::F32)?;
+        let output_mean = output_f32.mean_all()?;
+        let output_min = output_f32.min_all()?;
+        let output_max = output_f32.max_all()?;
 
-    println!("  Output mean: {:.6}", output_mean.to_scalar::<f32>()?);
-    println!("  Output min: {:.6}", output_min.to_scalar::<f32>()?);
-    println!("  Output max: {:.6}", output_max.to_scalar::<f32>()?);
+        println!("  Output mean: {:.6}", output_mean.to_scalar::<f32>()?);
+        println!("  Output min: {:.6}", output_min.to_scalar::<f32>()?);
+        println!("  Output max: {:.6}", output_max.to_scalar::<f32>()?);
+    }
 
     println!("\n🎉 Example completed successfully!");
 

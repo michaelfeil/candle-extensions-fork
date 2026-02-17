@@ -4,8 +4,8 @@
 
 use crate::error::{CuDNNError, Result};
 use crate::ffi;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::ptr;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 static NEXT_TENSOR_UID: AtomicI64 = AtomicI64::new(1);
 

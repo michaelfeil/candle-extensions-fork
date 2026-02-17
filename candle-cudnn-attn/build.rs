@@ -3,8 +3,9 @@ use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=include/cudnn_thd_frontend.h");
+    println!("cargo:rerun-if-changed=include/cudnn_frontend_impl.cpp");
 
-    // Find cuDNN installation
     let cudnn_include = find_cudnn_include();
     let cudnn_lib = find_cudnn_lib();
 
@@ -18,7 +19,6 @@ fn main() {
     let cudnn_lib = cudnn_lib.unwrap();
 
     println!("cargo:rustc-link-search=native={}", cudnn_lib.display());
-    // Link all cuDNN libraries for SDPA support
     println!("cargo:rustc-link-lib=dylib=cudnn");
     println!("cargo:rustc-link-lib=dylib=cudnn_ops");
     println!("cargo:rustc-link-lib=dylib=cudnn_adv");
@@ -27,12 +27,10 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=cudnn_heuristic");
     println!("cargo:rustc-link-lib=dylib=cudnn_engines_precompiled");
     println!("cargo:rustc-link-lib=dylib=cudnn_engines_runtime_compiled");
+    println!("cargo:rustc-link-lib=dylib=stdc++");
 
-    // Find CUDA include path
     let cuda_include = find_cuda_include();
 
-    // Generate bindings using bindgen
-    // Include all cuDNN headers for SDPA support
     let mut builder = bindgen::Builder::default()
         .header(cudnn_include.join("cudnn.h").to_str().unwrap())
         .header(cudnn_include.join("cudnn_ops.h").to_str().unwrap())
@@ -44,26 +42,39 @@ fn main() {
         .allowlist_type("cudnn.*")
         .allowlist_var("CUDNN.*");
 
-    // Add CUDA include path if found
-    if let Some(cuda_inc) = cuda_include {
+    if let Some(cuda_inc) = &cuda_include {
         builder = builder.clang_arg(format!("-I{}", cuda_inc.display()));
     }
 
     let bindings = builder.generate().expect("Unable to generate bindings");
-
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     bindings
         .write_to_file(out_path.join("bindings.rs"))
         .expect("Couldn't write bindings!");
+
+    let mut cpp = cc::Build::new();
+    cpp.cpp(true)
+        .file("include/cudnn_frontend_impl.cpp")
+        .include("include")
+        .include(&cudnn_include)
+        .flag_if_supported("-std=c++17")
+        .flag_if_supported("-O3");
+
+    if let Some(cuda_inc) = cuda_include {
+        cpp.include(cuda_inc);
+    }
+    if let Some(frontend_include) = find_cudnn_frontend_include() {
+        cpp.include(frontend_include);
+    }
+
+    cpp.compile("cudnn_frontend_impl");
 }
 
 fn find_cuda_include() -> Option<PathBuf> {
-    // Check environment variable first
     if let Ok(path) = env::var("CUDA_INCLUDE_DIR") {
         return Some(PathBuf::from(path));
     }
 
-    // Common paths - check CUDA 12.x locations first
     let paths = [
         "/usr/local/cuda-12.8/targets/x86_64-linux/include",
         "/usr/local/cuda-12.6/targets/x86_64-linux/include",
@@ -86,25 +97,16 @@ fn find_cuda_include() -> Option<PathBuf> {
 }
 
 fn find_cudnn_include() -> Option<PathBuf> {
-    // Check environment variable first
     if let Ok(path) = env::var("CUDNN_INCLUDE_DIR") {
         return Some(PathBuf::from(path));
     }
 
-    // APT-installed cuDNN 9.x (libcudnn9-dev-cuda-12)
-    // This is the primary location for apt-installed cuDNN
     let apt_path = PathBuf::from("/usr/include/x86_64-linux-gnu");
     if apt_path.join("cudnn.h").exists() {
         return Some(apt_path);
     }
 
-    // Fallback: Common paths
-    let paths = [
-        "/usr/local/cuda/include",
-        "/usr/include",
-        "/usr/local/include",
-    ];
-
+    let paths = ["/usr/local/cuda/include", "/usr/include", "/usr/local/include"];
     for path in &paths {
         let cudnn_h = PathBuf::from(path).join("cudnn.h");
         if cudnn_h.exists() {
@@ -116,19 +118,15 @@ fn find_cudnn_include() -> Option<PathBuf> {
 }
 
 fn find_cudnn_lib() -> Option<PathBuf> {
-    // Check environment variable first
     if let Ok(path) = env::var("CUDNN_LIB_DIR") {
         return Some(PathBuf::from(path));
     }
 
-    // APT-installed cuDNN 9.x (libcudnn9-cuda-12)
-    // This is the primary location for apt-installed cuDNN
     let apt_path = PathBuf::from("/usr/lib/x86_64-linux-gnu");
     if apt_path.join("libcudnn.so.9").exists() || apt_path.join("libcudnn.so").exists() {
         return Some(apt_path);
     }
 
-    // Fallback: Common paths
     let paths = [
         "/usr/local/cuda/lib64",
         "/usr/local/cuda/lib",
@@ -145,6 +143,29 @@ fn find_cudnn_lib() -> Option<PathBuf> {
         }
     }
 
+    None
+}
+
+fn find_cudnn_frontend_include() -> Option<PathBuf> {
+    if let Ok(path) = env::var("CUDNN_FRONTEND_INCLUDE_DIR") {
+        let p = PathBuf::from(path);
+        if p.join("cudnn_frontend/graph_interface.h").exists() {
+            return Some(p);
+        }
+    }
+
+    let paths = [
+        "/tmp/cudnn-frontend/include",
+        "/usr/local/include",
+        "/usr/include",
+        "/usr/include/x86_64-linux-gnu",
+    ];
+    for path in &paths {
+        let p = PathBuf::from(path);
+        if p.join("cudnn_frontend/graph_interface.h").exists() {
+            return Some(p);
+        }
+    }
     None
 }
 
